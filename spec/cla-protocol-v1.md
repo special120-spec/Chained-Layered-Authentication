@@ -256,6 +256,24 @@ this narrows H3 for accounts that opt in, it does not change the
 baseline for accounts that don't (see design doc §I on why the
 zero-proof path is structurally necessary, not a bug).
 
+## 6c. Session introspection (for a relying-party backend)
+
+```
+POST /v1/session/introspect   { session_token }
+                               -> { active: true, account_id, device_id, expires_at }
+                               -> { active: false }   // unknown, malformed, or expired token — same response for all three
+```
+
+RFC 7662-style (`active` boolean), server-to-server only — nothing a
+browser needs beyond what the `Authorization: Bearer` gate on
+`GET /v1/devices` and `GET /v1/account/:id/audit-log` already provides.
+Exists specifically for a relying-party backend written in a different
+language/process than this reference server (e.g. a platform's own API
+in Go, Python, etc.) that needs to know "is this session still valid,
+and for which account" without sharing this server's session store
+directly. Requires possessing the token to learn anything about it —
+same trust boundary as using the token, just phrased as a lookup.
+
 ## 7. Non-goals for v1.1
 
 Threshold/M-of-N signing, external transparency-log anchoring, self-service

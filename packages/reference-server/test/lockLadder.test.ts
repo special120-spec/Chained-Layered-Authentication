@@ -367,6 +367,30 @@ describe("CLA reference server", () => {
       expect(expired.status).toBe(401);
       expect(expired.body.error).toMatch(/expired/);
     });
+
+    it("POST /v1/session/introspect: for a relying-party backend that can't share this server's session store directly", async () => {
+      const accountId2 = `acct_${randomUUID()}`;
+      const credId2 = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId2 });
+      const finish = await post("/v1/devices/register/finish", {
+        account_id: accountId2,
+        attestationResponse: fakeAttestation(start.body.challenge, credId2),
+      });
+      const token = finish.body.session_token;
+
+      const active = await post("/v1/session/introspect", { session_token: token });
+      expect(active.status).toBe(200);
+      expect(active.body).toMatchObject({ active: true, account_id: accountId2, device_id: finish.body.device_id });
+      expect(active.body.expires_at).toBeGreaterThan(Date.now());
+
+      const bogus = await post("/v1/session/introspect", { session_token: "not-a-real-token" });
+      expect(bogus.status).toBe(200);
+      expect(bogus.body).toEqual({ active: false });
+
+      advanceClockSeconds(31 * 60); // past the 30-minute TTL
+      const expired = await post("/v1/session/introspect", { session_token: token });
+      expect(expired.body).toEqual({ active: false }); // expired reads the same as never-existed, not a distinct error
+    });
   });
 
   describe("/v1/auth/verify hardening", () => {

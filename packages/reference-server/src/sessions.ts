@@ -34,6 +34,24 @@ function getSession(db: Database, token: string): SessionRow | null {
   return row;
 }
 
+/**
+ * Server-to-server session introspection (RFC 7662-style `active` shape) —
+ * for a RELYING PARTY backend in a different language/process (e.g. a Go
+ * platform's own API) that needs to know "is this session_token still
+ * valid, and for which account" without re-implementing this reference
+ * server's session storage itself. Requires possessing the token to learn
+ * anything about it — same trust boundary as using the token directly,
+ * just phrased as a lookup instead of an action.
+ */
+export function introspectSession(
+  db: Database,
+  token: string
+): { accountId: string; deviceId: string | null; expiresAt: number } | null {
+  const session = getSession(db, token);
+  if (!session) return null;
+  return { accountId: session.account_id, deviceId: session.device_id, expiresAt: session.expires_at };
+}
+
 function bearerToken(req: Request): string | null {
   const header = req.header("authorization");
   if (!header?.startsWith("Bearer ")) return null;

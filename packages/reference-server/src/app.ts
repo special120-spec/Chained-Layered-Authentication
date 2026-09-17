@@ -8,6 +8,7 @@ import { devicesRouter } from "./routes/devices.js";
 import { authRouter } from "./routes/auth.js";
 import { accountRouter } from "./routes/account.js";
 import { totpRouter } from "./routes/totp.js";
+import { sessionRouter } from "./routes/session.js";
 import { createRateLimiter, byIp } from "./rateLimit.js";
 
 export function createApp(
@@ -43,6 +44,7 @@ export function createApp(
   app.use("/v1/auth", authRouter(db, chain, rp));
   app.use("/v1/account", accountRouter(db, chain, totpEncryptionKey));
   app.use("/v1/totp", totpRouter(db, chain, rp, totpEncryptionKey));
+  app.use("/v1/session", sessionRouter(db));
 
   // Final safety net (security review M3): every route is wrapped in
   // asyncHandler so rejections reach here instead of crashing the process,
