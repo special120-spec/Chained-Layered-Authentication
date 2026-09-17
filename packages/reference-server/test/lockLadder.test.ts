@@ -106,14 +106,17 @@ describe("CLA reference server", () => {
     return { status: res.status, body: await res.json() };
   }
 
-  async function get(path: string) {
-    const res = await fetch(`${baseUrl}${path}`);
+  async function get(path: string, sessionToken?: string) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : undefined,
+    });
     return { status: res.status, body: await res.json() };
   }
 
   describe("full lock-ladder lifecycle (single device)", () => {
     const accountId = `acct_${randomUUID()}`;
     const credId = `cred-${randomUUID()}`;
+    let sessionToken: string;
 
     it("registers the first device with no proof required", async () => {
       const start = await post("/v1/devices/register/start", { account_id: accountId });
@@ -125,6 +128,8 @@ describe("CLA reference server", () => {
       });
       expect(finish.status).toBe(200);
       expect(finish.body.layer).toBe("NORMAL");
+      expect(finish.body.session_token).toBeTruthy(); // security review H1/H2
+      sessionToken = finish.body.session_token;
     });
 
     it("a second bootstrap registration is rejected once a device is active", async () => {
@@ -162,7 +167,7 @@ describe("CLA reference server", () => {
     });
 
     it("the resulting chain is internally consistent and hash-verifiable end to end", async () => {
-      const audit = (await get(`/v1/account/${accountId}/audit-log`)).body as {
+      const audit = (await get(`/v1/account/${accountId}/audit-log`, sessionToken)).body as {
         events: ChainEvent[];
         receipts: Receipt[];
         layer: string;
@@ -173,6 +178,26 @@ describe("CLA reference server", () => {
       expect(result.valid).toBe(true);
       // one REGISTER + eleven FAILURE events
       expect(audit.events.length).toBe(12);
+    });
+
+    it("H1: the audit log is unreadable without a session, and unreadable with another account's session", async () => {
+      const noAuth = await get(`/v1/account/${accountId}/audit-log`);
+      expect(noAuth.status).toBe(401);
+
+      const otherAccount = `acct_${randomUUID()}`;
+      const otherCred = `cred-${randomUUID()}`;
+      const otherStart = await post("/v1/devices/register/start", { account_id: otherAccount });
+      const otherFinish = await post("/v1/devices/register/finish", {
+        account_id: otherAccount,
+        attestationResponse: fakeAttestation(otherStart.body.challenge, otherCred),
+      });
+
+      const wrongAccount = await get(`/v1/account/${accountId}/audit-log`, otherFinish.body.session_token);
+      expect(wrongAccount.status).toBe(403);
+
+      // The legitimate session for THIS account still works.
+      const rightAccount = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
+      expect(rightAccount.status).toBe(200);
     });
 
     it("a still-valid device signature can always initiate a step-up, even from RECOVERY", async () => {
@@ -215,6 +240,7 @@ describe("CLA reference server", () => {
     const deviceBCred = `cred-b-${randomUUID()}`;
     let deviceAId: string;
     let deviceBId: string;
+    let sessionToken: string;
 
     beforeAll(async () => {
       authShouldVerify = true;
@@ -224,6 +250,7 @@ describe("CLA reference server", () => {
         attestationResponse: fakeAttestation(start.body.challenge, deviceACred),
       });
       deviceAId = finish.body.device_id;
+      sessionToken = finish.body.session_token;
     });
 
     it("adding a second device requires proof from the first, and does not revoke it", async () => {
@@ -247,7 +274,7 @@ describe("CLA reference server", () => {
       deviceBId = finish.body.device_id;
       expect(deviceBId).not.toBe(deviceAId);
 
-      const list = await get(`/v1/devices?account_id=${accountId}`);
+      const list = await get(`/v1/devices?account_id=${accountId}`, sessionToken);
       expect(list.body.devices.map((d: { device_id: string }) => d.device_id).sort()).toEqual(
         [deviceAId, deviceBId].sort()
       );
@@ -284,7 +311,7 @@ describe("CLA reference server", () => {
       });
       expect(revoke.status).toBe(200);
 
-      const list = await get(`/v1/devices?account_id=${accountId}`);
+      const list = await get(`/v1/devices?account_id=${accountId}`, sessionToken);
       expect(list.body.devices.map((d: { device_id: string }) => d.device_id)).toEqual([deviceAId]);
 
       // device B can no longer authenticate
@@ -301,6 +328,45 @@ describe("CLA reference server", () => {
       expect(verify.status).toBe(401);
       expect(verify.body.layer).toBe("NORMAL"); // first failure, threshold not yet met
     });
+
+    it("H2: the device list is unreadable without a session, and unreadable with another account's session", async () => {
+      const noAuth = await get(`/v1/devices?account_id=${accountId}`);
+      expect(noAuth.status).toBe(401);
+
+      const otherAccount = `acct_${randomUUID()}`;
+      const otherCred = `cred-${randomUUID()}`;
+      const otherStart = await post("/v1/devices/register/start", { account_id: otherAccount });
+      const otherFinish = await post("/v1/devices/register/finish", {
+        account_id: otherAccount,
+        attestationResponse: fakeAttestation(otherStart.body.challenge, otherCred),
+      });
+
+      const wrongAccount = await get(`/v1/devices?account_id=${accountId}`, otherFinish.body.session_token);
+      expect(wrongAccount.status).toBe(403);
+
+      const rightAccount = await get(`/v1/devices?account_id=${accountId}`, sessionToken);
+      expect(rightAccount.status).toBe(200);
+    });
+
+    it("a session expires after its 30-minute TTL", async () => {
+      const accountId2 = `acct_${randomUUID()}`;
+      const credId2 = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId2 });
+      const finish = await post("/v1/devices/register/finish", {
+        account_id: accountId2,
+        attestationResponse: fakeAttestation(start.body.challenge, credId2),
+      });
+      const freshToken = finish.body.session_token;
+
+      const stillValid = await get(`/v1/devices?account_id=${accountId2}`, freshToken);
+      expect(stillValid.status).toBe(200);
+
+      advanceClockSeconds(31 * 60); // past the 30-minute TTL
+
+      const expired = await get(`/v1/devices?account_id=${accountId2}`, freshToken);
+      expect(expired.status).toBe(401);
+      expect(expired.body.error).toMatch(/expired/);
+    });
   });
 
   describe("/v1/auth/verify hardening", () => {
@@ -312,12 +378,13 @@ describe("CLA reference server", () => {
       const accountId = `acct_${randomUUID()}`;
       const credId = `cred-${randomUUID()}`;
       const start = await post("/v1/devices/register/start", { account_id: accountId });
-      await post("/v1/devices/register/finish", {
+      const registerFinish = await post("/v1/devices/register/finish", {
         account_id: accountId,
         attestationResponse: fakeAttestation(start.body.challenge, credId),
       });
+      const sessionToken = registerFinish.body.session_token;
 
-      const before = await get(`/v1/account/${accountId}/audit-log`);
+      const before = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
       expect(before.body.events.length).toBe(1); // just REGISTER
 
       for (let i = 0; i < 5; i++) {
@@ -329,7 +396,7 @@ describe("CLA reference server", () => {
         expect(verify.body.error).toMatch(/challenge/);
       }
 
-      const after = await get(`/v1/account/${accountId}/audit-log`);
+      const after = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
       expect(after.body.events.length).toBe(1); // still just REGISTER — no FAILUREs were ever recorded
       expect(after.body.layer).toBe("NORMAL");
     });
@@ -338,10 +405,11 @@ describe("CLA reference server", () => {
       const accountId = `acct_${randomUUID()}`;
       const credId = `cred-${randomUUID()}`;
       const start = await post("/v1/devices/register/start", { account_id: accountId });
-      await post("/v1/devices/register/finish", {
+      const registerFinish = await post("/v1/devices/register/finish", {
         account_id: accountId,
         attestationResponse: fakeAttestation(start.body.challenge, credId),
       });
+      const sessionToken = registerFinish.body.session_token;
 
       authShouldVerify = false;
       for (let i = 0; i < 3; i++) {
@@ -352,7 +420,7 @@ describe("CLA reference server", () => {
           assertionResponse: fakeAssertion(challenge.body.challenge, credId),
         });
       }
-      const engaged = await get(`/v1/account/${accountId}/audit-log`);
+      const engaged = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
       expect(engaged.body.layer).toBe("LOCK"); // 3 failures -> LOCK, per DEFAULT_POLICY
 
       // Immediately (no expireCooldown call) try another ordinary auth attempt.
@@ -367,7 +435,7 @@ describe("CLA reference server", () => {
 
       // The blocked attempt must not itself have been recorded as another
       // FAILURE or moved the ladder any further.
-      const stillLocked = await get(`/v1/account/${accountId}/audit-log`);
+      const stillLocked = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
       expect(stillLocked.body.layer).toBe("LOCK");
       expect(stillLocked.body.events.length).toBe(engaged.body.events.length);
 
@@ -413,10 +481,11 @@ describe("CLA reference server", () => {
       const accountId = `acct_${randomUUID()}`;
       const credId = `cred-${randomUUID()}`;
       const start = await post("/v1/devices/register/start", { account_id: accountId });
-      await post("/v1/devices/register/finish", {
+      const registerFinish = await post("/v1/devices/register/finish", {
         account_id: accountId,
         attestationResponse: fakeAttestation(start.body.challenge, credId),
       });
+      const sessionToken = registerFinish.body.session_token;
 
       authShouldVerify = false;
       const N = 8;
@@ -432,7 +501,7 @@ describe("CLA reference server", () => {
       // never a 500, never a hang.
       for (const r of results) expect([401, 429]).toContain(r.status);
 
-      const audit = (await get(`/v1/account/${accountId}/audit-log`)).body as {
+      const audit = (await get(`/v1/account/${accountId}/audit-log`, sessionToken)).body as {
         events: ChainEvent[];
         receipts: Receipt[];
       };
@@ -472,7 +541,7 @@ describe("CLA reference server", () => {
       });
       expect(second.status).toBe(401);
 
-      const audit = await get(`/v1/account/${accountId}/audit-log`);
+      const audit = await get(`/v1/account/${accountId}/audit-log`, first.body.session_token);
       const lastEvent = audit.body.events[audit.body.events.length - 1];
       expect(lastEvent.type).toBe("FAILURE");
       expect(lastEvent.detail.reason).toBe("possible_cloned_authenticator");

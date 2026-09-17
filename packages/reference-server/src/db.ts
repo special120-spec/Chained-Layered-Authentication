@@ -50,6 +50,14 @@ export interface AddTicketRow {
   used: number;
 }
 
+export interface SessionRow {
+  token: string;
+  account_id: string;
+  device_id: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
 export function openDb(path: string): Database.Database {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -103,6 +111,14 @@ export function openDb(path: string): Database.Database {
       authorized_by_device_id TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       used INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      device_id TEXT,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
     );
   `);
 

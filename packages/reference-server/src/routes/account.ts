@@ -5,6 +5,7 @@ import { safeEqual } from "../safeCompare.js";
 import { asyncHandler } from "../asyncHandler.js";
 import { isValidId } from "../validate.js";
 import { createRateLimiter, byAccountId, byIp } from "../rateLimit.js";
+import { requireSessionForAccount } from "../sessions.js";
 
 export function accountRouter(db: Database, chain: ChainStore): Router {
   const router = Router();
@@ -67,8 +68,16 @@ export function accountRouter(db: Database, chain: ChainStore): Router {
     })
   );
 
+  /**
+   * Session-gated (security review H1): this is the most information-dense
+   * endpoint in the API — every device add/revoke, every failure reason,
+   * every timestamp. `core/types.ts` documents the chain as "meant to be
+   * exportable to the account owner"; it should not be exportable to
+   * anyone who merely knows the account_id.
+   */
   router.get(
     "/:id/audit-log",
+    requireSessionForAccount(db, (req) => req.params.id),
     asyncHandler(async (req, res) => {
       const accountId = req.params.id;
       if (!isValidId(accountId)) return res.status(400).json({ error: "account id required" });

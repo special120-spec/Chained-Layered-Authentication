@@ -2,7 +2,7 @@
 
 Reviewed at commit `478d826` (`main`), scope per the review brief: `packages/reference-server` → `packages/core` → `packages/sdk-js` → `examples/demo`, in that priority order. Spec: `spec/cla-protocol-v1.md`. Known-limitations baseline: `SECURITY.md`.
 
-Status legend: 🔴 open · 🟢 fixed in this pass (applied directly to `chainStore.ts` / `routes/auth.ts` / `test/lockLadder.test.ts`, commit follows this file in the same push)
+Status legend: 🔴 open · 🟡 partially fixed (see entry for what remains) · 🟢 fixed, across several commits following the original review (see each entry's Files)
 
 ---
 
@@ -47,21 +47,25 @@ eleven times and walk the account `NORMAL → LOCK → STEP_UP → RECOVERY` wit
 
 ---
 
-## High — access control gaps (open)
+## High — access control gaps
 
-### H1 — 🔴 `GET /v1/account/:id/audit-log` is unauthenticated
-**File:** `packages/reference-server/src/routes/account.ts`
+### H1 — 🟢 FIXED: `GET /v1/account/:id/audit-log` was unauthenticated
+**Files:** new `src/sessions.ts`, `routes/account.ts`, `routes/auth.ts`, `routes/devices.ts`, `db.ts`
 
-Anyone who knows an `account_id` can read the full event history: device adds/revokes, failure reasons, timestamps of every attempt. `core/types.ts` documents the chain as "meant to be exportable to the account owner," but the route exports it to anyone.
+Anyone who knew an `account_id` could read the full event history: device adds/revokes, failure reasons, timestamps of every attempt.
 
-**Recommendation:** gate behind a real session. Note the reference server never actually issues the `session_token` the spec's endpoint table mentions for `/auth/verify` — that needs implementing before this can be fixed properly. At minimum, require a step-up-equivalent proof for this specific endpoint, since it's the most information-dense one in the API.
+**Fix applied:** the spec's `session_token` — previously specced but never actually issued — is now real. Every endpoint that completes a genuine WebAuthn ceremony (`register/finish`, `add/finish`, `rotate/finish`, `auth/verify`) mints an opaque, server-stored, 30-minute session scoped to that account, returned as `session_token`. `GET /v1/account/:id/audit-log` now requires it as `Authorization: Bearer <token>`, and the session's account must match the one being requested — a valid session for a DIFFERENT account gets `403`, not that other account's data (same response for both "no such account" and "wrong account," so a session holder can't use the error to probe account existence).
 
-### H2 — 🔴 `GET /v1/devices?account_id=...` is unauthenticated
+**Verified two ways:** the full mocked integration suite (new tests: no-token → 401, wrong-account-token → 403, right-token → 200, plus a session-expiry test advancing the fake clock past the 30-minute TTL), and separately against the **real, unmocked** running server via direct DB-seeded sessions over `curl` (no WebAuthn mocking involved in that pass) — same three outcomes confirmed live.
+
+**Still open:** the reference server's sessions live in SQLite, which is fine for one instance; a horizontally-scaled deployment needs the usual session-store considerations (shared store, revocation-on-logout, etc.) — out of scope for this reference implementation.
+
+### H2 — 🟢 FIXED: `GET /v1/devices?account_id=...` was unauthenticated
 **File:** `packages/reference-server/src/routes/devices.ts`
 
-Lower sensitivity than H1 (returns only `device_id`, `created_at`, `status`), but still lets anyone enumerate an account's device count/history without proof.
+Lower sensitivity than H1 (only `device_id`, `created_at`, `status`), but still let anyone enumerate an account's device history without proof.
 
-**Recommendation:** same session/step-up gate as H1, or accept as a documented trade-off if device metadata is considered non-sensitive for your deployment — but decide explicitly rather than by omission.
+**Fix applied:** same session gate as H1, same account-scoping check. Verified the same two ways (mocked integration tests + a live curl pass against the real server with a seeded session).
 
 ### H3 — 🟡 PARTIALLY FIXED: `/v1/account/recovery/start` had no rate limiting or owner notification
 **File:** `packages/reference-server/src/routes/account.ts`, new `src/rateLimit.ts`
@@ -135,10 +139,15 @@ Not in the original findings list — flagged separately while first reading the
 
 ---
 
+## Status: every C/H/M finding is now 🟢 or 🟡 (rate-limiting/session work), zero remaining 🔴
+
+Every Critical, High, and Medium finding from this review has been addressed (M1–M4, H1, H2 fully; H3's rate-limiting half fully, its notification half explicitly still open — see its entry). Only L1–L3 (low-severity, non-urgent hardening) remain untouched. 49 tests passing across all packages (was 22 at the start of this review), full build green.
+
 ## Suggested next steps, in order
 
-1. ~~Fix M1–M4~~ 🟢 done, plus the cloned-authenticator gap found along the way. 36 tests passing across all packages; the M4 concurrency regression test run 5x clean.
-2. ~~Add per-account and per-IP rate limiting~~ 🟡 done (H3's rate-limiting half; owner notification on recovery-start is still open — needs an actual email/push channel this reference server doesn't have). 42 tests passing.
-3. Implement session issuance for `/v1/auth/verify` (`session_token` is in the spec's endpoint table but not implemented), then gate H1/H2 behind it. Next up.
+1. ~~Fix M1–M4~~ 🟢 done, plus the cloned-authenticator gap found along the way.
+2. ~~Add per-account and per-IP rate limiting~~ 🟡 done (H3's rate-limiting half; owner notification is still open — needs an actual email/push channel this reference server doesn't have).
+3. ~~Implement session issuance, gate H1/H2 behind it~~ 🟢 done — `session_token` is now real, both previously-open endpoints require it and enforce account-scoping, verified against both the mocked suite and the live unmocked server.
 4. A basic fuzz pass on request bodies (oversized payloads, deeply nested objects, unicode edge cases) beyond the type-confusion case M3's fix specifically targets — `isValidId` is narrow by design, not a full schema validator.
-5. Recovery owner-notification (the open half of H3) and a shared rate-limit store for multi-instance deployments (the open half of both H3 and the in-memory limitation noted in H1/H2 below).
+5. Recovery owner-notification (the open half of H3) and a shared store for both the rate limiter and sessions in a multi-instance deployment (both currently in-memory/SQLite-single-process by reference-server design).
+6. L1–L3, whenever there's appetite for polish rather than fixes with real exploit scenarios behind them.

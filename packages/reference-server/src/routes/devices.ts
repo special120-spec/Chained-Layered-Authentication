@@ -7,6 +7,7 @@ import type { RpConfig } from "../webauthn.js";
 import type { AddTicketRow, RotationTicketRow } from "../db.js";
 import { asyncHandler } from "../asyncHandler.js";
 import { isValidId } from "../validate.js";
+import { createSession, requireSessionForAccount } from "../sessions.js";
 import {
   getActiveDevices,
   getActiveDeviceByCredentialId,
@@ -95,14 +96,22 @@ export function devicesRouter(db: Database, chain: ChainStore, rp: RpConfig): Ro
       const deviceId = insertDevice(db, account_id, credential.id, credential.publicKey, credential.counter);
 
       const { receipt } = await chain.recordRegister(account_id, deviceId);
-      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id) });
+      const session_token = createSession(db, account_id, deviceId);
+      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id), session_token });
     })
   );
 
   // ---- Listing ----
+  // Session-gated (security review H1/H2): device metadata is lower
+  // sensitivity than the full audit log, but still enough to enumerate an
+  // account's device history without proof — same gate as audit-log.
 
   router.get(
     "/",
+    requireSessionForAccount(db, (req) => {
+      const accountId = req.query.account_id;
+      return typeof accountId === "string" ? accountId : undefined;
+    }),
     asyncHandler(async (req, res) => {
       const accountId = req.query.account_id;
       if (!isValidId(accountId)) return res.status(400).json({ error: "account_id query param required" });
@@ -218,7 +227,8 @@ export function devicesRouter(db: Database, chain: ChainStore, rp: RpConfig): Ro
       const deviceId = insertDevice(db, account_id, credential.id, credential.publicKey, credential.counter);
 
       const { receipt } = await chain.recordDeviceAdd(account_id, deviceId, ticketRow.authorized_by_device_id);
-      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id) });
+      const session_token = createSession(db, account_id, deviceId);
+      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id), session_token });
     })
   );
 
@@ -325,7 +335,8 @@ export function devicesRouter(db: Database, chain: ChainStore, rp: RpConfig): Ro
       const deviceId = insertDevice(db, account_id, credential.id, credential.publicKey, credential.counter);
 
       const { receipt } = await chain.recordRotate(account_id, deviceId, ticketRow.old_device_id);
-      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id) });
+      const session_token = createSession(db, account_id, deviceId);
+      res.json({ device_id: deviceId, receipt, layer: chain.currentLayer(account_id), session_token });
     })
   );
 

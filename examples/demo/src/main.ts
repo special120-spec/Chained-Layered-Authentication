@@ -66,8 +66,13 @@ $("addDevice").addEventListener("click", async () => {
 });
 
 $("listDevices").addEventListener("click", async () => {
-  const devices = await client.listDevices();
-  log("devices", devices);
+  try {
+    const devices = await client.listDevices();
+    log("devices", devices);
+  } catch (err) {
+    // Now session-gated (security review H2) — register/authenticate first.
+    log("listDevices error", String(err));
+  }
 });
 
 $("revoke").addEventListener("click", async () => {
@@ -149,13 +154,22 @@ $("simulateFailures").addEventListener("click", async () => {
 });
 
 $("refreshLog").addEventListener("click", async () => {
-  const audit = await client.fetchAuditLog();
-  setLayer(audit.layer);
-  log("audit log", audit);
+  try {
+    const audit = await client.fetchAuditLog();
+    setLayer(audit.layer);
+    log("audit log", audit);
+  } catch (err) {
+    // Now session-gated (security review H1) — register/authenticate first.
+    log("refreshLog error", String(err));
+  }
 });
 
 $("verifyChain").addEventListener("click", async () => {
-  const audit = await client.fetchAuditLog();
-  const result = await client.verifyAuditLog(audit);
-  log("chain verification", { valid: result.valid, reason: result.reason });
+  try {
+    const audit = await client.fetchAuditLog();
+    const result = await client.verifyAuditLog(audit);
+    log("chain verification", { valid: result.valid, reason: result.reason });
+  } catch (err) {
+    log("verifyChain error", String(err));
+  }
 });

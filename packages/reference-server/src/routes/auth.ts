@@ -6,6 +6,7 @@ import type { RpConfig } from "../webauthn.js";
 import { asyncHandler } from "../asyncHandler.js";
 import { isValidId } from "../validate.js";
 import { createRateLimiter, byAccountId } from "../rateLimit.js";
+import { createSession } from "../sessions.js";
 import {
   getActiveDevices,
   getActiveDeviceByCredentialId,
@@ -141,7 +142,8 @@ export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Route
         ? await chain.recordStepUpOk(account_id, device.device_id)
         : await chain.recordSuccess(account_id, device.device_id);
 
-      res.json({ receipt, layer: chain.currentLayer(account_id), device_id: device.device_id });
+      const session_token = createSession(db, account_id, device.device_id);
+      res.json({ receipt, layer: chain.currentLayer(account_id), device_id: device.device_id, session_token });
     })
   );
 

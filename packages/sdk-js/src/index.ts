@@ -2,6 +2,7 @@ import { startRegistration, startAuthentication } from "@simplewebauthn/browser"
 import { verifyChain, type ChainEvent, type Layer, type Receipt } from "@cla/core";
 import { ReceiptStore } from "./receipts.js";
 import { DeviceIdCache } from "./deviceCache.js";
+import { SessionStore } from "./sessionStore.js";
 
 export type { Layer, ChainEvent, Receipt };
 
@@ -33,11 +34,13 @@ type LockStateListener = (layer: Layer) => void;
 export class CLA {
   private readonly receipts: ReceiptStore;
   private readonly deviceCache: DeviceIdCache;
+  private readonly sessionStore: SessionStore;
   private listeners: LockStateListener[] = [];
 
   constructor(private readonly options: ClaOptions) {
     this.receipts = new ReceiptStore(options.accountId);
     this.deviceCache = new DeviceIdCache(options.accountId);
+    this.sessionStore = new SessionStore(options.accountId);
   }
 
   onLockStateChange(listener: LockStateListener): () => void {
@@ -60,9 +63,10 @@ export class CLA {
     return { status: res.status, body: await res.json() };
   }
 
-  private track(result: { receipt?: Receipt; layer?: Layer }) {
+  private track(result: { receipt?: Receipt; layer?: Layer; session_token?: string }) {
     if (result.receipt) this.receipts.save(result.receipt);
     if (result.layer) this.notify(result.layer);
+    if (result.session_token) this.sessionStore.set(result.session_token);
   }
 
   /** Registers this account's very first device. Fails with 409 once one is already active — use `addDevice()` from then on. */
@@ -108,11 +112,16 @@ export class CLA {
     return { deviceId: finish.body.device_id, layer: finish.body.layer };
   }
 
-  /** Every active device on the account, most-recently-added last. */
+  /**
+   * Every active device on the account, most-recently-added last. Requires
+   * a session from a prior register()/addDevice()/rotateKey()/authenticate()
+   * call in this SDK instance (or a shared localStorage origin) — throws if
+   * none is cached, since the server will reject the request anyway.
+   */
   async listDevices(): Promise<DeviceInfo[]> {
-    const res = await fetch(`${this.options.serverUrl}/v1/devices?account_id=${encodeURIComponent(this.options.accountId)}`);
-    const body = await res.json();
-    return body.devices;
+    const res = await this.getWithSession(`/v1/devices?account_id=${encodeURIComponent(this.options.accountId)}`);
+    if (res.status !== 200) throw new Error(res.body.error ?? "failed to list devices");
+    return res.body.devices;
   }
 
   /** Ordinary sign-in. On failure, the layer may have escalated — check the thrown error's `.layer`. */
@@ -213,9 +222,25 @@ export class CLA {
     return { layer: res.body.layer };
   }
 
+  /**
+   * Requires a session from a prior register()/addDevice()/rotateKey()/
+   * authenticate() call — this endpoint is the most information-dense in
+   * the API (every device add/revoke, every failure reason, every
+   * timestamp) and is gated server-side accordingly.
+   */
   async fetchAuditLog(): Promise<AuditLog> {
-    const res = await fetch(`${this.options.serverUrl}/v1/account/${this.options.accountId}/audit-log`);
-    return res.json();
+    const res = await this.getWithSession(`/v1/account/${this.options.accountId}/audit-log`);
+    if (res.status !== 200) throw new Error(res.body.error ?? "failed to fetch audit log");
+    return res.body;
+  }
+
+  private async getWithSession(path: string): Promise<{ status: number; body: any }> {
+    const token = this.sessionStore.get();
+    if (!token) throw new Error("no session — call register(), addDevice(), rotateKey(), or authenticate() first");
+    const res = await fetch(`${this.options.serverUrl}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return { status: res.status, body: await res.json() };
   }
 
   /**
