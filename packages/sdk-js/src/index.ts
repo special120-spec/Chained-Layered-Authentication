@@ -1,6 +1,7 @@
 import { startRegistration, startAuthentication } from "@simplewebauthn/browser";
 import { verifyChain, type ChainEvent, type Layer, type Receipt } from "@cla/core";
 import { ReceiptStore } from "./receipts.js";
+import { DeviceIdCache } from "./deviceCache.js";
 
 export type { Layer, ChainEvent, Receipt };
 
@@ -15,6 +16,12 @@ export interface AuditLog {
   layer: Layer;
 }
 
+export interface DeviceInfo {
+  device_id: string;
+  created_at: string;
+  status: "active" | "revoked";
+}
+
 type LockStateListener = (layer: Layer) => void;
 
 /**
@@ -25,10 +32,12 @@ type LockStateListener = (layer: Layer) => void;
  */
 export class CLA {
   private readonly receipts: ReceiptStore;
+  private readonly deviceCache: DeviceIdCache;
   private listeners: LockStateListener[] = [];
 
   constructor(private readonly options: ClaOptions) {
     this.receipts = new ReceiptStore(options.accountId);
+    this.deviceCache = new DeviceIdCache(options.accountId);
   }
 
   onLockStateChange(listener: LockStateListener): () => void {
@@ -56,7 +65,7 @@ export class CLA {
     if (result.layer) this.notify(result.layer);
   }
 
-  /** Registers this device. Fails with 409 if the account already has an active device — use `rotateKey()` instead. */
+  /** Registers this account's very first device. Fails with 409 once one is already active — use `addDevice()` from then on. */
   async register(): Promise<{ deviceId: string; layer: Layer }> {
     const { accountId } = this.options;
     const start = await this.postJson<any>("/v1/devices/register/start", { account_id: accountId });
@@ -69,7 +78,41 @@ export class CLA {
     });
     if (finish.status !== 200) throw new Error(finish.body.error ?? "registration failed");
     this.track(finish.body);
+    this.deviceCache.set(finish.body.device_id);
     return { deviceId: finish.body.device_id, layer: finish.body.layer };
+  }
+
+  /**
+   * Adds another device to an account that already has one, authorized by
+   * an assertion from any existing active device — never by re-running the
+   * bootstrap flow. Every other device on the account is left untouched
+   * (unlike `rotateKey`, which replaces one device with another).
+   */
+  async addDevice(): Promise<{ deviceId: string; layer: Layer }> {
+    const { accountId } = this.options;
+    const challengeRes = await this.postJson<any>("/v1/devices/add/challenge", { account_id: accountId });
+    if (challengeRes.status !== 200) throw new Error(challengeRes.body.error);
+    const assertionResponse = await startAuthentication({ optionsJSON: challengeRes.body });
+    const start = await this.postJson<any>("/v1/devices/add/start", { account_id: accountId, assertionResponse });
+    if (start.status !== 200) throw new Error(start.body.error);
+
+    const attestationResponse = await startRegistration({ optionsJSON: start.body.registerOptions });
+    const finish = await this.postJson<any>("/v1/devices/add/finish", {
+      account_id: accountId,
+      add_ticket: start.body.add_ticket,
+      attestationResponse,
+    });
+    if (finish.status !== 200) throw new Error(finish.body.error);
+    this.track(finish.body);
+    this.deviceCache.set(finish.body.device_id);
+    return { deviceId: finish.body.device_id, layer: finish.body.layer };
+  }
+
+  /** Every active device on the account, most-recently-added last. */
+  async listDevices(): Promise<DeviceInfo[]> {
+    const res = await fetch(`${this.options.serverUrl}/v1/devices?account_id=${encodeURIComponent(this.options.accountId)}`);
+    const body = await res.json();
+    return body.devices;
   }
 
   /** Ordinary sign-in. On failure, the layer may have escalated — check the thrown error's `.layer`. */
@@ -106,27 +149,49 @@ export class CLA {
       err.layer = verifyRes.body.layer;
       throw err;
     }
+    if (verifyRes.body.device_id) this.deviceCache.set(verifyRes.body.device_id);
     return { layer: verifyRes.body.layer };
   }
 
-  async revokeDevice(): Promise<{ layer: Layer }> {
+  /**
+   * Revokes `deviceId` — defaults to whichever device this SDK instance
+   * last used successfully (self-revoke), but any active device can
+   * authorize revoking any other: pass an id from `listDevices()` to kill
+   * a different one, e.g. "use my laptop to revoke my lost phone."
+   */
+  async revokeDevice(deviceId?: string): Promise<{ layer: Layer }> {
     const { accountId } = this.options;
+    const target = deviceId ?? this.deviceCache.get();
+    if (!target) throw new Error("no device id known — pass one explicitly, or call listDevices() first");
+
     const challengeRes = await this.postJson<any>("/v1/devices/revoke/challenge", { account_id: accountId });
     if (challengeRes.status !== 200) throw new Error(challengeRes.body.error);
     const assertionResponse = await startAuthentication({ optionsJSON: challengeRes.body });
-    const res = await this.postJson<any>("/v1/devices/revoke", { account_id: accountId, assertionResponse });
+    const res = await this.postJson<any>("/v1/devices/revoke", { account_id: accountId, device_id: target, assertionResponse });
     if (res.status !== 200) throw new Error(res.body.error);
     this.track(res.body);
     return { layer: res.body.layer };
   }
 
-  /** Proves possession of the current device, then registers a new one and revokes the old — self-certifying rotation, no server-side identity re-check. */
-  async rotateKey(): Promise<{ deviceId: string; layer: Layer }> {
+  /**
+   * Proves possession of `deviceId` (defaults to this SDK's last-known
+   * device), then registers a new credential in its place and revokes the
+   * old one — self-certifying rotation, no server-side identity re-check.
+   * Every other device on the account is untouched.
+   */
+  async rotateKey(deviceId?: string): Promise<{ deviceId: string; layer: Layer }> {
     const { accountId } = this.options;
-    const challengeRes = await this.postJson<any>("/v1/devices/rotate/challenge", { account_id: accountId });
+    const target = deviceId ?? this.deviceCache.get();
+    if (!target) throw new Error("no device id known — pass one explicitly, or call listDevices() first");
+
+    const challengeRes = await this.postJson<any>("/v1/devices/rotate/challenge", { account_id: accountId, device_id: target });
     if (challengeRes.status !== 200) throw new Error(challengeRes.body.error);
     const assertionResponse = await startAuthentication({ optionsJSON: challengeRes.body });
-    const start = await this.postJson<any>("/v1/devices/rotate/start", { account_id: accountId, assertionResponse });
+    const start = await this.postJson<any>("/v1/devices/rotate/start", {
+      account_id: accountId,
+      device_id: target,
+      assertionResponse,
+    });
     if (start.status !== 200) throw new Error(start.body.error);
 
     const attestationResponse = await startRegistration({ optionsJSON: start.body.registerOptions });
@@ -137,6 +202,7 @@ export class CLA {
     });
     if (finish.status !== 200) throw new Error(finish.body.error);
     this.track(finish.body);
+    this.deviceCache.set(finish.body.device_id);
     return { deviceId: finish.body.device_id, layer: finish.body.layer };
   }
 

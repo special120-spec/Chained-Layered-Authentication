@@ -15,10 +15,27 @@ export interface StoredCredential {
   counter: number;
 }
 
-export function getActiveDevice(db: Database, accountId: string): DeviceRow | undefined {
+export function getActiveDevices(db: Database, accountId: string): DeviceRow[] {
   return db
-    .prepare(`SELECT * FROM devices WHERE account_id = ? AND status = 'active'`)
-    .get(accountId) as DeviceRow | undefined;
+    .prepare(`SELECT * FROM devices WHERE account_id = ? AND status = 'active' ORDER BY created_at ASC`)
+    .all(accountId) as DeviceRow[];
+}
+
+export function getDeviceById(db: Database, accountId: string, deviceId: string): DeviceRow | undefined {
+  return db
+    .prepare(`SELECT * FROM devices WHERE account_id = ? AND device_id = ?`)
+    .get(accountId, deviceId) as DeviceRow | undefined;
+}
+
+/** Resolves WHICH active device just produced an assertion, by the credential id embedded in it. */
+export function getActiveDeviceByCredentialId(
+  db: Database,
+  accountId: string,
+  credentialId: string
+): DeviceRow | undefined {
+  return db
+    .prepare(`SELECT * FROM devices WHERE account_id = ? AND credential_id = ? AND status = 'active'`)
+    .get(accountId, credentialId) as DeviceRow | undefined;
 }
 
 export function toCredential(row: DeviceRow): StoredCredential {
@@ -49,16 +66,23 @@ export function consumeChallenge(db: Database, accountId: string, purpose: strin
   return true;
 }
 
+/**
+ * Issues a challenge that ANY of the given devices may satisfy — the
+ * platform's own UI picks which registered credential the user actually
+ * signs with; the server resolves which one afterward from the assertion's
+ * credential id (getActiveDeviceByCredentialId), rather than assuming
+ * there's only one possible signer.
+ */
 export async function issueAuthChallenge(
   db: Database,
   rp: RpConfig,
   accountId: string,
   purpose: string,
-  device: DeviceRow
+  devices: DeviceRow[]
 ) {
   const options = await generateAuthenticationOptions({
     rpID: rp.rpID,
-    allowCredentials: [{ id: device.credential_id }],
+    allowCredentials: devices.map((d) => ({ id: d.credential_id })),
     userVerification: "preferred",
   });
   recordChallenge(db, accountId, purpose, options.challenge);

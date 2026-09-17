@@ -56,10 +56,25 @@ $("stepUp").addEventListener("click", async () => {
   }
 });
 
-$("revoke").addEventListener("click", async () => {
+$("addDevice").addEventListener("click", async () => {
   try {
-    const result = await client.revokeDevice();
-    log("revoke", result);
+    const result = await client.addDevice();
+    log("addDevice", result);
+  } catch (err) {
+    log("addDevice error", String(err));
+  }
+});
+
+$("listDevices").addEventListener("click", async () => {
+  const devices = await client.listDevices();
+  log("devices", devices);
+});
+
+$("revoke").addEventListener("click", async () => {
+  const target = $<HTMLInputElement>("revokeTarget").value.trim() || undefined;
+  try {
+    const result = await client.revokeDevice(target);
+    log("revoke", { target: target ?? "(this device)", ...result });
   } catch (err) {
     log("revoke error", String(err));
   }

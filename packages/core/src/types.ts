@@ -3,6 +3,7 @@ export type Layer = (typeof LAYER_ORDER)[number];
 
 export const EVENT_TYPES = [
   "REGISTER",
+  "DEVICE_ADD",
   "SUCCESS",
   "FAILURE",
   "LOCK",

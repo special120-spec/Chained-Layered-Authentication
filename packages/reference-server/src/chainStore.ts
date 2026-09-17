@@ -142,9 +142,18 @@ export class ChainStore {
     };
   }
 
+  /** Emitted only for an account's very first device — the one bootstrap case with no proof requirement. */
   async recordRegister(accountId: string, deviceId: string) {
     const layer = this.currentLayer(accountId);
     return this.append(accountId, deviceId, "REGISTER", layer, layer);
+  }
+
+  /** Every device after the first: always authorized by an assertion from an existing active device. */
+  async recordDeviceAdd(accountId: string, deviceId: string, authorizedByDeviceId: string) {
+    const layer = this.currentLayer(accountId);
+    return this.append(accountId, deviceId, "DEVICE_ADD", layer, layer, {
+      authorized_by_device_id: authorizedByDeviceId,
+    });
   }
 
   /** Ordinary successful assertion. Does not step an elevated layer down — only an explicit step-up does. */
@@ -172,9 +181,12 @@ export class ChainStore {
     return this.append(accountId, deviceId, "STEP_UP_OK", layer, nextLayer);
   }
 
-  async recordRevoke(accountId: string, deviceId: string) {
+  /** `deviceId` is the TARGET being revoked; `authorizedByDeviceId` is whichever active device signed for it (may be the same device, self-revoking). */
+  async recordRevoke(accountId: string, deviceId: string, authorizedByDeviceId: string) {
     const layer = this.currentLayer(accountId);
-    return this.append(accountId, deviceId, "REVOKE", layer, layer);
+    return this.append(accountId, deviceId, "REVOKE", layer, layer, {
+      authorized_by_device_id: authorizedByDeviceId,
+    });
   }
 
   async recordRotate(accountId: string, newDeviceId: string, oldDeviceId: string) {

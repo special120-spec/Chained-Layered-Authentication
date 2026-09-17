@@ -37,7 +37,19 @@
       <button id="register">Register device</button>
       <button id="authenticate">Authenticate</button>
       <button id="rotate">Rotate key</button>
-      <button id="revoke">Revoke device</button>
+    </section>
+
+    <section>
+      <h3>Devices</h3>
+      <p class="hint">
+        Add a second device from the same browser — Windows Hello will create a second, distinct credential for you
+        to choose between. Any active device can then revoke any other.
+      </p>
+      <button id="addDevice">Add another device</button>
+      <button id="listDevices">List devices</button>
+      <br />
+      <label>Revoke device id (blank = this device): <input id="revokeTarget" placeholder="device id" /></label>
+      <button id="revoke">Revoke</button>
     </section>
 
     <section>

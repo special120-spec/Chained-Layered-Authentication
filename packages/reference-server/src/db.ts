@@ -42,6 +42,14 @@ export interface RotationTicketRow {
   used: number;
 }
 
+export interface AddTicketRow {
+  ticket: string;
+  account_id: string;
+  authorized_by_device_id: string;
+  created_at: number;
+  used: number;
+}
+
 export function openDb(path: string): Database.Database {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -85,6 +93,14 @@ export function openDb(path: string): Database.Database {
       ticket TEXT PRIMARY KEY,
       account_id TEXT NOT NULL,
       old_device_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS add_tickets (
+      ticket TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      authorized_by_device_id TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       used INTEGER NOT NULL DEFAULT 0
     );

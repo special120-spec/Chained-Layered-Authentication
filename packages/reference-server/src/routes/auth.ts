@@ -3,7 +3,14 @@ import type { Database } from "better-sqlite3";
 import { verifyAuthenticationResponse } from "@simplewebauthn/server";
 import type { ChainStore } from "../chainStore.js";
 import type { RpConfig } from "../webauthn.js";
-import { getActiveDevice, toCredential, consumeChallenge, issueAuthChallenge, decodeClientData } from "../deviceHelpers.js";
+import {
+  getActiveDevices,
+  getActiveDeviceByCredentialId,
+  toCredential,
+  consumeChallenge,
+  issueAuthChallenge,
+  decodeClientData,
+} from "../deviceHelpers.js";
 
 export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Router {
   const router = Router();
@@ -11,11 +18,11 @@ export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Route
   router.post("/challenge", async (req, res) => {
     const { account_id, purpose } = req.body ?? {};
     if (!account_id) return res.status(400).json({ error: "account_id required" });
-    const device = getActiveDevice(db, account_id);
-    if (!device) return res.status(404).json({ error: "no active device for this account" });
+    const devices = getActiveDevices(db, account_id);
+    if (devices.length === 0) return res.status(404).json({ error: "no active device for this account" });
 
     const challengePurpose = purpose === "step_up" ? "step_up" : "auth";
-    res.json(await issueAuthChallenge(db, rp, account_id, challengePurpose, device));
+    res.json(await issueAuthChallenge(db, rp, account_id, challengePurpose, devices));
   });
 
   router.post("/verify", async (req, res) => {
@@ -25,10 +32,14 @@ export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Route
     }
     const isStepUp = purpose === "step_up";
     const challengePurpose = isStepUp ? "step_up" : "auth";
-    const device = getActiveDevice(db, account_id);
+
+    // Resolve WHICH active device this assertion claims to be from — with
+    // multiple devices, the server can no longer assume "the" device.
+    const credentialId: string | undefined = assertionResponse.id ?? assertionResponse.rawId;
+    const device = credentialId ? getActiveDeviceByCredentialId(db, account_id, credentialId) : undefined;
 
     if (!device) {
-      const { receipt } = await chain.recordFailure(account_id, null, "no_active_device");
+      const { receipt } = await chain.recordFailure(account_id, null, "unrecognized_device");
       return res.status(401).json({ error: "authentication failed", receipt, layer: chain.currentLayer(account_id) });
     }
 
@@ -67,7 +78,7 @@ export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Route
       ? await chain.recordStepUpOk(account_id, device.device_id)
       : await chain.recordSuccess(account_id, device.device_id);
 
-    res.json({ receipt, layer: chain.currentLayer(account_id) });
+    res.json({ receipt, layer: chain.currentLayer(account_id), device_id: device.device_id });
   });
 
   return router;

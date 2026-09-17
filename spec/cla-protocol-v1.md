@@ -4,6 +4,11 @@ Status: draft. This is the versioned, implementable subset of the design doc.
 Changes to this file should go through review distinct from ordinary SDK/server
 bug fixes (see the repo's `README.md` on governance).
 
+**v1.1**: adds multi-device support (§2, §6). No breaking changes to the
+chain format or lock-state derivation — existing v1 chains remain valid;
+`REGISTER` is now emitted only for an account's first device, with
+subsequent devices emitting `DEVICE_ADD` (§3).
+
 ## 1. Scope
 
 This spec defines: the device identity model, the challenge-response
@@ -18,9 +23,22 @@ anchoring — those are out of scope for v1 (see design doc §D.2, §F).
   authenticator support). The server stores `{device_id, account_id,
   public_key, sign_count, status, created_at}`. `status` is one of
   `active | revoked`.
-- v1 supports exactly one *active* device per account at a time, plus zero or
-  more `revoked` devices kept for audit history. Multi-device is out of scope
-  for v1 (design doc §K).
+- An account may have **any number of active devices** simultaneously, plus
+  zero or more `revoked` devices kept for audit history. The *first* device
+  an account registers requires no proof (that's the bootstrap case — there's
+  nothing yet to prove possession of); every device added after that must be
+  authorized by an assertion from an *existing* active device (§6,
+  `/v1/devices/add/*`) — never by re-running the bootstrap flow.
+- Any active device may authorize revoking any other device on the same
+  account (§6, `/v1/devices/revoke`) — "use my laptop to kill my lost phone."
+  A device may also revoke itself. Revoking the last remaining active device
+  is allowed and is exactly the state recovery (§7 of the design doc) exists
+  to recover from.
+- Auth and step-up challenges list every active device as an allowed
+  credential (`allowCredentials`); the platform picks which one the user
+  actually signs with, and the server resolves *which* device authenticated
+  from the credential id in the assertion response — it no longer assumes
+  there is only one possible signer.
 
 ## 3. Chain events
 
@@ -32,7 +50,7 @@ type ChainEvent = {
   seq: number;            // 0-indexed, strictly increasing per account
   account_id: string;
   device_id: string | null;   // null for account-level events (e.g. RECOVERY_START)
-  type: "REGISTER" | "SUCCESS" | "FAILURE" | "LOCK" | "UNLOCK"
+  type: "REGISTER" | "DEVICE_ADD" | "SUCCESS" | "FAILURE" | "LOCK" | "UNLOCK"
       | "STEP_UP_OK" | "REVOKE" | "ROTATE" | "RECOVERY_START" | "RECOVERY_COMPLETE";
   layer_before: Layer;
   layer_after: Layer;
@@ -107,20 +125,38 @@ bodies are JSON; all mutating endpoints return the resulting `Receipt` and
 current `layer`.
 
 ```
-POST /v1/devices/register/start      { account_id }
-                                      -> { challenge, rp, user, pubKeyCredParams }
+POST /v1/devices/register/start      { account_id }                      // bootstrap only: 409 if the
+                                      -> { challenge, rp, user, pubKeyCredParams }   // account already has an active device
 POST /v1/devices/register/finish     { account_id, attestationResponse }
                                       -> { device_id, receipt, layer }
-POST /v1/auth/challenge              { account_id }
-                                      -> { challenge }
-POST /v1/auth/verify                 { account_id, assertionResponse }
-                                      -> { session_token?, receipt, layer }
-POST /v1/devices/rotate/start        { account_id, assertionResponse }   // proves possession of old device
-                                      -> { rotation_ticket, registerChallenge }
+
+POST /v1/devices/add/challenge       { account_id }                      // 404 if no active device exists yet
+                                      -> { challenge, allowCredentials }          // (use register/start instead)
+POST /v1/devices/add/start           { account_id, assertionResponse }   // proves possession of an existing device
+                                      -> { add_ticket, registerOptions }
+POST /v1/devices/add/finish          { account_id, add_ticket, attestationResponse }
+                                      -> { device_id, receipt, layer }          // old device(s) stay active
+
+GET  /v1/devices                     ?account_id=...
+                                      -> { devices: [{ device_id, created_at, status }] }
+
+POST /v1/auth/challenge              { account_id, purpose? }            // allowCredentials = every active device
+                                      -> { challenge, allowCredentials }
+POST /v1/auth/verify                 { account_id, assertionResponse, purpose? }
+                                      -> { session_token?, receipt, layer }   // signer resolved from the assertion's credential id
+
+POST /v1/devices/rotate/challenge    { account_id, device_id }           // rotate is still self-rotation:
+                                      -> { challenge }                          // the device being replaced proves itself
+POST /v1/devices/rotate/start        { account_id, device_id, assertionResponse }
+                                      -> { rotation_ticket, registerOptions }
 POST /v1/devices/rotate/finish       { account_id, rotation_ticket, attestationResponse }
                                       -> { device_id, receipt, layer }
-POST /v1/devices/revoke              { account_id, assertionResponse }
-                                      -> { receipt, layer }
+
+POST /v1/devices/revoke/challenge    { account_id }                      // any active device may sign this
+                                      -> { challenge }
+POST /v1/devices/revoke              { account_id, device_id, assertionResponse } // device_id = the TARGET to revoke;
+                                      -> { receipt, layer }                        // the signer may be a different device
+
 POST /v1/account/recovery/start      { account_id }
                                       -> { receipt, layer }               // human-mediated from here (v1)
 POST /v1/account/recovery/complete   { account_id, admin_token }          // placeholder for support flow
@@ -128,7 +164,8 @@ POST /v1/account/recovery/complete   { account_id, admin_token }          // pla
 GET  /v1/account/:id/audit-log       -> { events: ChainEvent[], receipts: Receipt[] }
 ```
 
-## 7. Non-goals for v1
+## 7. Non-goals for v1.1
 
-Threshold/M-of-N signing, multi-device, external transparency-log anchoring,
-self-service recovery keys, the six-layer ladder. See design doc §K.
+Threshold/M-of-N signing, external transparency-log anchoring, self-service
+recovery keys, the six-layer ladder. (Multi-device shipped in v1.1 — see the
+changelog note at the top of this file.) See design doc §K.
