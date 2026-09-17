@@ -28,6 +28,11 @@ systems like this end up over-claiming their own strength):
    adds friction, it must never fully seal out the legitimate owner (that
    would turn the lockout itself into a denial-of-service tool).
 
+Optional: TOTP (authenticator-app codes) as a second factor — never a
+replacement for a WebAuthn device, which is still required to enroll or
+remove it. Can complete a step-up, and can optionally gate account recovery
+for accounts that enroll it. See spec §6b.
+
 ## Packages
 
 | Package | What it is |

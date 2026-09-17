@@ -58,6 +58,23 @@ export interface SessionRow {
   expires_at: number;
 }
 
+export interface TotpEnrollTicketRow {
+  ticket: string;
+  account_id: string;
+  encrypted_secret: string;
+  authorized_by_device_id: string;
+  created_at: number;
+  used: number;
+}
+
+/** One active TOTP secret per account. `last_consumed_step` is the anti-replay high-water mark — see totpStore.ts. */
+export interface TotpSecretRow {
+  account_id: string;
+  encrypted_secret: string;
+  last_consumed_step: number;
+  created_at: string;
+}
+
 export function openDb(path: string): Database.Database {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -119,6 +136,31 @@ export function openDb(path: string): Database.Database {
       device_id TEXT,
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL
+    );
+
+    -- Pending, unconfirmed TOTP secrets, mirroring add_tickets: a secret
+    -- only becomes the account's active one (in totp_secrets) once the
+    -- user proves they actually programmed their authenticator app with it
+    -- (enroll/finish). Ticket expiry/reuse semantics match add_tickets.
+    CREATE TABLE IF NOT EXISTS totp_enroll_tickets (
+      ticket TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      encrypted_secret TEXT NOT NULL,
+      authorized_by_device_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- At most one row per account: the currently-active TOTP secret, if
+    -- any. encrypted_secret is never stored in the clear (see
+    -- totpCrypto.ts). last_consumed_step is the anti-replay high-water
+    -- mark: a code matching a step at or before this value is rejected
+    -- even if it's numerically correct for that step.
+    CREATE TABLE IF NOT EXISTS totp_secrets (
+      account_id TEXT PRIMARY KEY,
+      encrypted_secret TEXT NOT NULL,
+      last_consumed_step INTEGER NOT NULL DEFAULT -1,
+      created_at TEXT NOT NULL
     );
   `);
 

@@ -74,6 +74,8 @@ Requiring no signature here is a documented, structurally necessary trade-off (�
 
 **Fix applied (the rate-limiting half):** a new in-memory `createRateLimiter` (fixed-window, per-key) is now wired in at three layers: a general 120/min/IP backstop across all of `/v1/*`; a 30/min-per-account limiter on `/v1/auth/challenge` and `/v1/auth/verify` (defense-in-depth for the residual gap noted in the C1 fix — calling `/challenge` first is still free, this bounds how fast that path can be exercised); and endpoint-specific limits on `/v1/account/recovery/start` (3/hour/account) and `/recovery/complete` (10/hour, both per-account and per-IP). Unit-tested directly (`test/rateLimit.test.ts`) plus one integration test confirming the real wiring (`recovery/start`'s cap trips on the 4th call, a different account is unaffected).
 
+**Narrowed further for accounts that opt in (TOTP):** `/v1/account/recovery/start` now also checks for an enrolled TOTP secret (see "New: optional TOTP support" below) and, if present, requires a valid code before proceeding — a wrong or missing code counts as a `FAILURE` against the same lock ladder/cooldown as any other failed proof. This only helps accounts that opt in; an account with no second factor enrolled is exactly as exposed as the rate-limited baseline above — a narrowing, not a substitute for the still-open item below.
+
 **Still open (the notification half):** nothing fires a signal to the account's registered contact when recovery is requested. This needs an actual notification channel (email/push) that doesn't exist anywhere in this reference server yet — out of scope for an in-process fix, flagged here so it isn't lost.
 
 Also still open, same root cause as H1/H2 below: this reference server is in-memory/single-process, so the rate limiter (and everything else) resets on restart and doesn't share state across multiple instances — fine for the reference implementation, not for a horizontally-scaled deployment (would need a shared store, e.g. Redis).
@@ -117,6 +119,29 @@ Not in the original findings list — flagged separately while first reading the
 
 ---
 
+## New: optional TOTP (authenticator app) support
+
+Added as a genuinely optional second factor — not a replacement for WebAuthn, and not usable as a primary auth method. See spec §6b for the full endpoint contract.
+
+**Files:** `core/src/totp.ts` (pure RFC 4226/6238 HOTP/TOTP, Web Crypto only — no `node:crypto`, so it stays usable from a browser bundle the same way `chain.ts` does), `reference-server/src/totpCrypto.ts` (AES-256-GCM encryption at rest, its own key file separate from the Ed25519 signing key), `reference-server/src/totpStore.ts` (anti-replay bookkeeping — a `last_consumed_step` high-water mark per account, since the pure `core` module deliberately doesn't do this itself), `reference-server/src/routes/totp.ts` (enroll/verify/disable endpoints, wrapped in the same `asyncHandler`/`isValidId` discipline as every other route), plus additions to `chainStore.ts` (`TOTP_ENROLLED`/`TOTP_DISABLED` event types, `deviceId: string | null` and a `detail`/`extraDetail` param threaded through `recordSuccess`/`recordFailure`/`recordStepUpOk` so a TOTP-based proof can be tagged `{ method: "totp" }` without a parallel code path).
+
+**Design constraints this respects:**
+- **Enrolling or disabling TOTP requires proving possession of an existing active device first** — the exact same bar as `/v1/devices/add`. TOTP can never bootstrap itself; it can only be attached to an account that already has a working WebAuthn device.
+- **TOTP failures count against the same lock ladder and cooldown as WebAuthn failures.** There is no parallel failure counter to dodge — a wrong TOTP code and a wrong WebAuthn signature both call `chain.recordFailure`, and both are subject to the C2 cooldown gate for anything other than a step-up.
+- **TOTP can only complete a `step_up`, never a `purpose: "auth"` request.** Enforced server-side (`/v1/totp/verify` rejects any other purpose with `400`), not just a documentation convention.
+- **The shared secret is encrypted at rest**, with its own AES-256-GCM key file (`.data/totp-key.json` by default, `CLA_TOTP_KEY_PATH` to override), kept separate from the Ed25519 signing key so a compromise of one doesn't automatically compromise the other.
+- **Anti-replay is enforced**: a code is only accepted once, even though RFC 6238's ±1-step window would otherwise let the same code validate for up to ~60-90 seconds.
+- **This narrows H3, it doesn't close it** — see the updated H3 entry above.
+
+**Verified:** `core/test/totp.test.ts` checks the HOTP/TOTP math against all 6 official RFC 6238 test vectors, plus replay-window edge cases and base32 round-tripping (15 tests). `reference-server/test/lockLadder.test.ts` adds end-to-end coverage: enrollment gated on device possession, a wrong enrollment confirmation code not touching the chain, a real step-up ceremony completed via TOTP, replay of the same code correctly rejected, `purpose` enforcement, `404` for unenrolled accounts, the `recovery/start` gate for both enrolled and non-enrolled accounts, and disable removing the gate (7 tests) — all against the session-gated audit-log endpoint from the H1 fix, not a pre-H1 snapshot. 71 tests pass workspace-wide (was 49).
+
+**Deliberately out of scope for this pass:**
+- No client-side (SDK) helper for enrollment yet — a developer integrating this today calls the REST endpoints directly. An `sdk-js` convenience wrapper (`enrollTotp()`/`verifyTotp()`) would be a reasonable follow-up.
+- No rate limiting on `/v1/totp/verify` or the enroll endpoints beyond what the underlying lock ladder already provides for `verify`'s `FAILURE` path, and the general 120/min/IP backstop that already covers every `/v1/*` route including these.
+- No support for multiple simultaneous TOTP secrets per account (e.g., for account recovery from a backup authenticator) — one active secret per account, matching the "at most one row" schema design. Multiple secrets would need a small schema change (drop the `account_id` primary key in favor of a `secret_id`) but isn't difficult to add later.
+
+---
+
 ## Low / hardening (open, non-urgent)
 
 ### L1 — Account enumeration
@@ -141,7 +166,7 @@ Not in the original findings list — flagged separately while first reading the
 
 ## Status: every C/H/M finding is now 🟢 or 🟡 (rate-limiting/session work), zero remaining 🔴
 
-Every Critical, High, and Medium finding from this review has been addressed (M1–M4, H1, H2 fully; H3's rate-limiting half fully, its notification half explicitly still open — see its entry). Only L1–L3 (low-severity, non-urgent hardening) remain untouched. 49 tests passing across all packages (was 22 at the start of this review), full build green.
+Every Critical, High, and Medium finding from this review has been addressed (M1–M4, H1, H2 fully; H3's rate-limiting half fully, further narrowed by optional TOTP, its notification half explicitly still open — see its entry). Only L1–L3 (low-severity, non-urgent hardening) remain untouched. 71 tests passing across all packages (was 22 at the start of this review), full build green.
 
 ## Suggested next steps, in order
 

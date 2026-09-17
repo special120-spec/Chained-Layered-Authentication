@@ -193,13 +193,19 @@ export class ChainStore {
     });
   }
 
-  /** Ordinary successful assertion. Does not step an elevated layer down — only an explicit step-up does. */
-  async recordSuccess(accountId: string, deviceId: string) {
+  /** Ordinary successful assertion. Does not step an elevated layer down — only an explicit step-up does. `deviceId` is null when the proof wasn't tied to a specific WebAuthn device (e.g. a TOTP-based check — see detail.method). */
+  async recordSuccess(accountId: string, deviceId: string | null, detail?: Record<string, unknown>) {
     const layer = this.currentLayer(accountId);
-    return this.append(accountId, deviceId, "SUCCESS", layer, layer);
+    return this.append(accountId, deviceId, "SUCCESS", layer, layer, detail);
   }
 
-  async recordFailure(accountId: string, deviceId: string | null, reason: string) {
+  /** `extraDetail` lets callers tag which proof method failed (e.g. `{ method: "totp" }`) without inventing a parallel failure-counting mechanism — a TOTP failure counts against exactly the same ladder/cooldown as a WebAuthn one. */
+  async recordFailure(
+    accountId: string,
+    deviceId: string | null,
+    reason: string,
+    extraDetail?: Record<string, unknown>
+  ) {
     const layer = this.currentLayer(accountId);
     const sinceSeq = this.lastLayerChangeSeq(accountId);
     const priorFailures = this.countFailuresSinceWithinWindow(accountId, sinceSeq, DEFAULT_POLICY.windowMs);
@@ -208,14 +214,15 @@ export class ChainStore {
     return this.append(accountId, deviceId, "FAILURE", layer, nextLayer, {
       reason,
       cooldown_seconds: cooldown,
+      ...extraDetail,
     });
   }
 
-  /** A dedicated, explicit step-up ceremony succeeded: steps the ladder down exactly one layer. */
-  async recordStepUpOk(accountId: string, deviceId: string) {
+  /** A dedicated, explicit step-up ceremony succeeded: steps the ladder down exactly one layer. `deviceId` is null for a TOTP-based step-up (see detail.method). */
+  async recordStepUpOk(accountId: string, deviceId: string | null, detail?: Record<string, unknown>) {
     const layer = this.currentLayer(accountId);
     const nextLayer = stepDown(layer);
-    return this.append(accountId, deviceId, "STEP_UP_OK", layer, nextLayer);
+    return this.append(accountId, deviceId, "STEP_UP_OK", layer, nextLayer, detail);
   }
 
   /** `deviceId` is the TARGET being revoked; `authorizedByDeviceId` is whichever active device signed for it (may be the same device, self-revoking). */
@@ -241,5 +248,17 @@ export class ChainStore {
   async recordRecoveryComplete(accountId: string) {
     const layer = this.currentLayer(accountId);
     return this.append(accountId, null, "RECOVERY_COMPLETE", layer, "NORMAL");
+  }
+
+  /** TOTP enrollment always requires proving possession of an existing active device first (same bar as DEVICE_ADD) — `deviceId` is that authorizing device, for audit purposes, never a device the secret itself is bound to. */
+  async recordTotpEnrolled(accountId: string, authorizedByDeviceId: string) {
+    const layer = this.currentLayer(accountId);
+    return this.append(accountId, authorizedByDeviceId, "TOTP_ENROLLED", layer, layer);
+  }
+
+  /** Same bar as enrolling: an active device must authorize removing TOTP. */
+  async recordTotpDisabled(accountId: string, authorizedByDeviceId: string) {
+    const layer = this.currentLayer(accountId);
+    return this.append(accountId, authorizedByDeviceId, "TOTP_DISABLED", layer, layer);
   }
 }

@@ -15,6 +15,14 @@ H1-H3 from a security review — `session_token` is now actually issued
 read endpoints that expose per-account data. No chain/event-format
 changes.
 
+**v1.3**: optional TOTP (authenticator-app codes) as a second factor
+(§6b) — never a replacement for a WebAuthn device, which is still
+required to enroll or remove it. Two new chain event types,
+`TOTP_ENROLLED`/`TOTP_DISABLED` (§3). TOTP can complete a `step_up`
+and can optionally gate `/v1/account/recovery/start` for accounts that
+enroll it, narrowing H3 further for those accounts; it changes nothing
+for accounts that don't enroll.
+
 ## 1. Scope
 
 This spec defines: the device identity model, the challenge-response
@@ -57,11 +65,12 @@ type ChainEvent = {
   account_id: string;
   device_id: string | null;   // null for account-level events (e.g. RECOVERY_START)
   type: "REGISTER" | "DEVICE_ADD" | "SUCCESS" | "FAILURE" | "LOCK" | "UNLOCK"
-      | "STEP_UP_OK" | "REVOKE" | "ROTATE" | "RECOVERY_START" | "RECOVERY_COMPLETE";
+      | "STEP_UP_OK" | "REVOKE" | "ROTATE" | "RECOVERY_START" | "RECOVERY_COMPLETE"
+      | "TOTP_ENROLLED" | "TOTP_DISABLED";
   layer_before: Layer;
   layer_after: Layer;
   timestamp: string;       // ISO 8601 UTC
-  detail?: Record<string, unknown>; // e.g. { reason: "bad_signature" }
+  detail?: Record<string, unknown>; // e.g. { reason: "bad_signature" }, or { method: "totp" } on a TOTP-based SUCCESS/FAILURE/STEP_UP_OK
 };
 
 type Layer = "NORMAL" | "LOCK" | "STEP_UP" | "RECOVERY";
@@ -196,6 +205,56 @@ Layered, not a single global rule (security review H3):
 The reference server's limiter is in-memory and per-process — correct for
 a single instance, not sufficient on its own for a horizontally-scaled
 deployment (which would need a shared store).
+
+## 6b. TOTP (optional second factor)
+
+Standard RFC 4226/6238 (HOTP/TOTP), SHA-1, 6 digits, 30s step, ±1 step
+clock-skew window — the parameters every authenticator app assumes.
+Strictly opt-in and strictly secondary:
+
+- **Enrolling or disabling TOTP requires proving possession of an
+  existing active device first** — the same bar as `/v1/devices/add`.
+  TOTP can never bootstrap an account; it can only be attached to one
+  that already has a working WebAuthn device.
+- **TOTP can only complete a `purpose: "step_up"` request, never
+  `"auth"`.** Enforced server-side, not just documented.
+- **A wrong TOTP code counts as a chain `FAILURE`**, against the exact
+  same lock ladder and cooldown a wrong WebAuthn signature would — no
+  parallel failure-counting mechanism to dodge.
+- **The shared secret is encrypted at rest** (AES-256-GCM, its own key
+  file separate from the Ed25519 signing key — see design doc §J on why
+  a confidentiality key and an authenticity key shouldn't share a blast
+  radius).
+- **Replay is prevented**: each account's active secret tracks the
+  highest time-step ever accepted; a numerically-correct code for an
+  already-consumed step is rejected.
+
+```
+POST /v1/totp/enroll/challenge   { account_id }
+                                  -> { challenge, allowCredentials }        // proves an existing device first
+POST /v1/totp/enroll/start       { account_id, assertionResponse }
+                                  -> { enroll_ticket, secret_base32, provisioning_uri, digits, period }
+POST /v1/totp/enroll/finish      { account_id, enroll_ticket, code }       // confirms the user's app is actually programmed
+                                  -> { receipt, layer }                     // emits TOTP_ENROLLED
+
+POST /v1/totp/verify             { account_id, code, purpose: "step_up" }  // "auth" is rejected with 400
+                                  -> { receipt, layer }
+
+POST /v1/totp/disable/challenge  { account_id }
+                                  -> { challenge, allowCredentials }
+POST /v1/totp/disable            { account_id, assertionResponse }
+                                  -> { receipt, layer }                     // emits TOTP_DISABLED
+```
+
+**Optional recovery gate**: if an account has TOTP enrolled,
+`POST /v1/account/recovery/start` additionally requires a valid `code`
+in the request body — a wrong or missing code is a `400`/`401` (and a
+real code failure counts as a chain `FAILURE`, throttled the same as
+everything else). Accounts that never enroll TOTP see no change to
+`recovery/start`'s existing zero-friction, rate-limited-only behavior —
+this narrows H3 for accounts that opt in, it does not change the
+baseline for accounts that don't (see design doc §I on why the
+zero-proof path is structurally necessary, not a bug).
 
 ## 7. Non-goals for v1.1
 

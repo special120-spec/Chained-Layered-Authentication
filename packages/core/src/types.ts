@@ -13,6 +13,8 @@ export const EVENT_TYPES = [
   "ROTATE",
   "RECOVERY_START",
   "RECOVERY_COMPLETE",
+  "TOTP_ENROLLED",
+  "TOTP_DISABLED",
 ] as const;
 export type ChainEventType = (typeof EVENT_TYPES)[number];
 

@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID, randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type Database from "better-sqlite3";
-import { verifyChain, type ChainEvent, type Receipt } from "@cla/core";
+import { verifyChain, totp, base32Decode, type ChainEvent, type Receipt } from "@cla/core";
 
 // We mock @simplewebauthn/server entirely: this test exercises OUR chain +
 // lock-ladder + multi-device route wiring, not WebAuthn's own cryptography
@@ -80,7 +80,7 @@ describe("CLA reference server", () => {
     process.env.CLA_RATE_LIMIT_IP_MAX = "100000";
     db = openDb(":memory:");
     const { privateKey } = generateKeyPairSync("ed25519");
-    const app = createApp(db, privateKey, "test-key");
+    const app = createApp(db, privateKey, "test-key", randomBytes(32));
     const server = app.listen(0);
     const { port } = server.address() as AddressInfo;
     baseUrl = `http://127.0.0.1:${port}`;
@@ -567,6 +567,171 @@ describe("CLA reference server", () => {
       const otherAccount = `acct_${randomUUID()}`;
       const otherRes = await post("/v1/account/recovery/start", { account_id: otherAccount });
       expect(otherRes.status).toBe(200);
+    });
+  });
+
+  describe("TOTP", () => {
+    async function setUpAccountWithDevice() {
+      const accountId = `acct_${randomUUID()}`;
+      const credId = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId });
+      const finish = await post("/v1/devices/register/finish", {
+        account_id: accountId,
+        attestationResponse: fakeAttestation(start.body.challenge, credId),
+      });
+      return { accountId, credId, sessionToken: finish.body.session_token as string };
+    }
+
+    async function enrollTotp(accountId: string, credId: string) {
+      const challenge = await post("/v1/totp/enroll/challenge", { account_id: accountId });
+      const startRes = await post("/v1/totp/enroll/start", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+      });
+      expect(startRes.status).toBe(200);
+      const secret = base32Decode(startRes.body.secret_base32);
+      const code = await totp(secret, Date.now());
+      const finishRes = await post("/v1/totp/enroll/finish", {
+        account_id: accountId,
+        enroll_ticket: startRes.body.enroll_ticket,
+        code,
+      });
+      expect(finishRes.status).toBe(200);
+      return secret;
+    }
+
+    it("enrollment requires an existing device's signature and is recorded on the chain", async () => {
+      const { accountId, credId, sessionToken } = await setUpAccountWithDevice();
+      const secret = await enrollTotp(accountId, credId);
+      expect(secret.length).toBe(20);
+
+      const log = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
+      const enrolled = log.body.events.find((e: ChainEvent) => e.type === "TOTP_ENROLLED");
+      expect(enrolled).toBeDefined();
+      expect(enrolled.layer_before).toBe(enrolled.layer_after); // layer-neutral, like DEVICE_ADD
+      expect(log.body.layer).toBe("NORMAL");
+    });
+
+    it("a wrong confirmation code at enroll/finish is rejected without consuming the ticket or touching the chain", async () => {
+      const { accountId, credId, sessionToken } = await setUpAccountWithDevice();
+      const challenge = await post("/v1/totp/enroll/challenge", { account_id: accountId });
+      const startRes = await post("/v1/totp/enroll/start", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+      });
+
+      const wrongAttempt = await post("/v1/totp/enroll/finish", {
+        account_id: accountId,
+        enroll_ticket: startRes.body.enroll_ticket,
+        code: "000000",
+      });
+      expect(wrongAttempt.status).toBe(400);
+
+      // The ticket is still usable — a typo during onboarding isn't a
+      // possession-proof failure and shouldn't need re-authenticating.
+      const secret = base32Decode(startRes.body.secret_base32);
+      const correctCode = await totp(secret, Date.now());
+      const retryRes = await post("/v1/totp/enroll/finish", {
+        account_id: accountId,
+        enroll_ticket: startRes.body.enroll_ticket,
+        code: correctCode,
+      });
+      expect(retryRes.status).toBe(200);
+
+      const log = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
+      expect(log.body.events.filter((e: ChainEvent) => e.type === "FAILURE").length).toBe(0);
+    });
+
+    it("completes a STEP_UP and enforces replay protection (the same code cannot be reused)", async () => {
+      const { accountId, credId, sessionToken } = await setUpAccountWithDevice();
+      const secret = await enrollTotp(accountId, credId);
+
+      // Drive the account to STEP_UP via ordinary WebAuthn failures, same
+      // pattern as the lifecycle test above.
+      authShouldVerify = false;
+      for (let i = 0; i < 8; i++) {
+        advanceClockSeconds(120);
+        const challenge = await post("/v1/auth/challenge", { account_id: accountId });
+        await post("/v1/auth/verify", {
+          account_id: accountId,
+          assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+        });
+      }
+      const engaged = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
+      expect(engaged.body.layer).toBe("STEP_UP");
+      authShouldVerify = true;
+
+      advanceClockSeconds(120); // fresh time step, independent of the failure loop above
+      const code = await totp(secret, Date.now());
+      const stepUp = await post("/v1/totp/verify", { account_id: accountId, code, purpose: "step_up" });
+      expect(stepUp.status).toBe(200);
+      expect(stepUp.body.layer).toBe("LOCK"); // one step down from STEP_UP
+
+      // Immediately replaying the SAME code must fail, even though it's
+      // still numerically correct for that time step.
+      const replay = await post("/v1/totp/verify", { account_id: accountId, code, purpose: "step_up" });
+      expect(replay.status).toBe(401);
+      expect(replay.body.layer).toBe("LOCK"); // did not step down further, and did not escalate up either
+    });
+
+    it("rejects any purpose other than step_up", async () => {
+      const { accountId, credId } = await setUpAccountWithDevice();
+      const secret = await enrollTotp(accountId, credId);
+      const code = await totp(secret, Date.now());
+      const res = await post("/v1/totp/verify", { account_id: accountId, code, purpose: "auth" });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 for an account with no TOTP enrolled", async () => {
+      const { accountId } = await setUpAccountWithDevice();
+      const res = await post("/v1/totp/verify", { account_id: accountId, code: "123456", purpose: "step_up" });
+      expect(res.status).toBe(404);
+    });
+
+    it("gates /v1/account/recovery/start once enrolled, but never for accounts that never enrolled", async () => {
+      const { accountId } = await setUpAccountWithDevice();
+
+      // Not enrolled: original zero-friction behavior is unchanged.
+      const unenrolled = await post("/v1/account/recovery/start", { account_id: accountId });
+      expect(unenrolled.status).toBe(200);
+
+      const { accountId: accountId2, credId: credId2, sessionToken: sessionToken2 } = await setUpAccountWithDevice();
+      const secret = await enrollTotp(accountId2, credId2);
+
+      const noCode = await post("/v1/account/recovery/start", { account_id: accountId2 });
+      expect(noCode.status).toBe(400);
+
+      const wrongCode = await post("/v1/account/recovery/start", { account_id: accountId2, code: "000000" });
+      expect(wrongCode.status).toBe(401);
+      const afterWrong = await get(`/v1/account/${accountId2}/audit-log`, sessionToken2);
+      expect(afterWrong.body.events.some((e: ChainEvent) => e.type === "FAILURE")).toBe(true);
+
+      advanceClockSeconds(120);
+      const correctCode = await totp(secret, Date.now());
+      const started = await post("/v1/account/recovery/start", { account_id: accountId2, code: correctCode });
+      expect(started.status).toBe(200);
+      expect(started.body.layer).toBe("RECOVERY");
+    });
+
+    it("disable requires an existing device's signature, and afterward the recovery gate and step-up path are both gone", async () => {
+      const { accountId, credId, sessionToken } = await setUpAccountWithDevice();
+      await enrollTotp(accountId, credId);
+
+      const challenge = await post("/v1/totp/disable/challenge", { account_id: accountId });
+      const disableRes = await post("/v1/totp/disable", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+      });
+      expect(disableRes.status).toBe(200);
+
+      const verifyAfter = await post("/v1/totp/verify", { account_id: accountId, code: "123456", purpose: "step_up" });
+      expect(verifyAfter.status).toBe(404);
+
+      const recoveryAfter = await post("/v1/account/recovery/start", { account_id: accountId });
+      expect(recoveryAfter.status).toBe(200); // gate is gone — back to zero-friction, matching an account that never enrolled
+
+      const log = await get(`/v1/account/${accountId}/audit-log`, sessionToken);
+      expect(log.body.events.some((e: ChainEvent) => e.type === "TOTP_DISABLED")).toBe(true);
     });
   });
 });

@@ -6,8 +6,9 @@ import { asyncHandler } from "../asyncHandler.js";
 import { isValidId } from "../validate.js";
 import { createRateLimiter, byAccountId, byIp } from "../rateLimit.js";
 import { requireSessionForAccount } from "../sessions.js";
+import { getActiveTotp, verifyAndConsumeTotpCode } from "../totpStore.js";
 
-export function accountRouter(db: Database, chain: ChainStore): Router {
+export function accountRouter(db: Database, chain: ChainStore, totpKey: Buffer): Router {
   const router = Router();
 
   /**
@@ -22,13 +23,40 @@ export function accountRouter(db: Database, chain: ChainStore): Router {
    * between "structurally necessary" and "anyone who knows account_id can
    * force RECOVERY on demand, repeatedly, forever." 3/hour is generous for
    * a genuinely locked-out owner, punishing for an attacker automating it.
+   *
+   * If the account has TOTP enrolled, it becomes a real (if soft) gate
+   * here too: a `code` is then required and checked before recovery
+   * starts. This directly narrows H3 further for any account that opts
+   * in — accounts that never enrolled TOTP keep the original zero-friction
+   * behavior unchanged, since for them this is the only path that can work
+   * at all.
    */
   router.post(
     "/recovery/start",
     createRateLimiter({ windowMs: 60 * 60_000, max: 3, keyFn: byAccountId, code: "rate_limited" }),
     asyncHandler(async (req, res) => {
-      const { account_id } = req.body ?? {};
+      const { account_id, code } = req.body ?? {};
       if (!isValidId(account_id)) return res.status(400).json({ error: "account_id required" });
+
+      if (getActiveTotp(db, account_id)) {
+        if (typeof code !== "string" || code.length === 0) {
+          return res
+            .status(400)
+            .json({ error: "TOTP is enrolled on this account; a code is required to start recovery" });
+        }
+        const outcome = await verifyAndConsumeTotpCode(db, totpKey, account_id, code, Date.now());
+        if (outcome !== "ok") {
+          // Counts against the same lock ladder/cooldown as any other
+          // failure — an attacker guessing codes here now gets throttled
+          // exactly like a wrong WebAuthn signature would be.
+          const { receipt } = await chain.recordFailure(account_id, null, "totp_bad_code", {
+            method: "totp",
+            context: "recovery_start",
+          });
+          return res.status(401).json({ error: "invalid code", receipt, layer: chain.currentLayer(account_id) });
+        }
+      }
+
       const { receipt } = await chain.recordRecoveryStart(account_id);
       res.json({
         receipt,
