@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import type Database from "better-sqlite3";
 import { verifyChain, type ChainEvent, type Receipt } from "@cla/core";
 
 // We mock @simplewebauthn/server entirely: this test exercises OUR chain +
@@ -43,6 +44,19 @@ function clientDataJSON(challenge: string, type: string): string {
   return Buffer.from(JSON.stringify({ challenge, type, origin: "http://localhost:5173" })).toString("base64url");
 }
 
+/**
+ * Advances the mocked wall clock so `cooldownRemainingSeconds` reads the
+ * previous attempt as expired. Deliberately does NOT rewrite any already-
+ * stored `timestamp` — that field is part of what's hashed into
+ * `entry_hash` (spec §3), so editing history after the fact breaks the
+ * chain, exactly as the tamper-evidence design intends. Only `Date` is
+ * faked (not setTimeout/setInterval), so the real HTTP server, sockets,
+ * and `fetch` calls this suite makes are unaffected.
+ */
+function advanceClockSeconds(seconds: number) {
+  vi.setSystemTime(new Date(Date.now() + seconds * 1000));
+}
+
 function fakeAttestation(challenge: string, credentialId: string) {
   return { id: credentialId, rawId: credentialId, response: { clientDataJSON: clientDataJSON(challenge, "webauthn.create") } };
 }
@@ -54,19 +68,28 @@ function fakeAssertion(challenge: string, credentialId: string) {
 describe("CLA reference server", () => {
   let baseUrl: string;
   let close: () => void;
+  let db: Database.Database;
 
   beforeAll(() => {
     process.env.CLA_ADMIN_TOKEN = "test-admin-token";
-    const db = openDb(":memory:");
+    db = openDb(":memory:");
     const { privateKey } = generateKeyPairSync("ed25519");
     const app = createApp(db, privateKey, "test-key");
     const server = app.listen(0);
     const { port } = server.address() as AddressInfo;
     baseUrl = `http://127.0.0.1:${port}`;
     close = () => server.close();
+    // Only Date is faked (never setTimeout/setInterval), so the real
+    // server/socket/fetch machinery this suite depends on is untouched —
+    // this exists purely so advanceClockSeconds can simulate elapsed time
+    // for cooldown checks without rewriting stored history.
+    vi.useFakeTimers({ toFake: ["Date"] });
   });
 
-  afterAll(() => close());
+  afterAll(() => {
+    vi.useRealTimers();
+    close();
+  });
 
   async function post(path: string, body: unknown) {
     const res = await fetch(`${baseUrl}${path}`, {
@@ -114,6 +137,14 @@ describe("CLA reference server", () => {
       ];
 
       for (const expected of expectedLayerAfterFailure) {
+        // Advance past any cooldown from the previous iteration first: this
+        // test is exercising ladder progression across many failures, not
+        // the cooldown gate itself (that's covered separately below), and a
+        // real deployment would naturally have this much time between
+        // distinct attempts anyway. 120s clears any cooldown this sequence
+        // produces (max 64s) while staying well inside the 15-minute
+        // rolling failure-count window, which is a separate mechanism.
+        advanceClockSeconds(120);
         const challengeRes = await post("/v1/auth/challenge", { account_id: accountId });
         const verifyRes = await post("/v1/auth/verify", {
           account_id: accountId,
@@ -263,6 +294,88 @@ describe("CLA reference server", () => {
       });
       expect(verify.status).toBe(401);
       expect(verify.body.layer).toBe("NORMAL"); // first failure, threshold not yet met
+    });
+  });
+
+  describe("/v1/auth/verify hardening", () => {
+    it("a request with no valid, previously-issued challenge is rejected WITHOUT touching the chain at all", async () => {
+      // Regression test for the finding: an attacker who never called
+      // /v1/auth/challenge, and supplies a garbage credential id, must not
+      // be able to record a FAILURE or move the lock ladder — not even a
+      // little. Deliberately skips /challenge entirely.
+      const accountId = `acct_${randomUUID()}`;
+      const credId = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId });
+      await post("/v1/devices/register/finish", {
+        account_id: accountId,
+        attestationResponse: fakeAttestation(start.body.challenge, credId),
+      });
+
+      const before = await get(`/v1/account/${accountId}/audit-log`);
+      expect(before.body.events.length).toBe(1); // just REGISTER
+
+      for (let i = 0; i < 5; i++) {
+        const verify = await post("/v1/auth/verify", {
+          account_id: accountId,
+          assertionResponse: fakeAssertion("never-issued-challenge", "never-registered-cred"),
+        });
+        expect(verify.status).toBe(400);
+        expect(verify.body.error).toMatch(/challenge/);
+      }
+
+      const after = await get(`/v1/account/${accountId}/audit-log`);
+      expect(after.body.events.length).toBe(1); // still just REGISTER — no FAILUREs were ever recorded
+      expect(after.body.layer).toBe("NORMAL");
+    });
+
+    it("cooldown blocks an immediate repeat auth attempt once the ladder has engaged, but never blocks step-up", async () => {
+      const accountId = `acct_${randomUUID()}`;
+      const credId = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId });
+      await post("/v1/devices/register/finish", {
+        account_id: accountId,
+        attestationResponse: fakeAttestation(start.body.challenge, credId),
+      });
+
+      authShouldVerify = false;
+      for (let i = 0; i < 3; i++) {
+        advanceClockSeconds(120); // isolate ladder progression from the cooldown under test
+        const challenge = await post("/v1/auth/challenge", { account_id: accountId });
+        await post("/v1/auth/verify", {
+          account_id: accountId,
+          assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+        });
+      }
+      const engaged = await get(`/v1/account/${accountId}/audit-log`);
+      expect(engaged.body.layer).toBe("LOCK"); // 3 failures -> LOCK, per DEFAULT_POLICY
+
+      // Immediately (no expireCooldown call) try another ordinary auth attempt.
+      const challenge = await post("/v1/auth/challenge", { account_id: accountId });
+      const blocked = await post("/v1/auth/verify", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge.body.challenge, credId),
+      });
+      expect(blocked.status).toBe(429);
+      expect(blocked.body.error).toBe("cooldown_active");
+      expect(blocked.body.retry_after_seconds).toBeGreaterThan(0);
+
+      // The blocked attempt must not itself have been recorded as another
+      // FAILURE or moved the ladder any further.
+      const stillLocked = await get(`/v1/account/${accountId}/audit-log`);
+      expect(stillLocked.body.layer).toBe("LOCK");
+      expect(stillLocked.body.events.length).toBe(engaged.body.events.length);
+
+      // But a step-up, immediately, with no cooldown expiry, must go through.
+      authShouldVerify = true;
+      const stepUpChallenge = await post("/v1/auth/challenge", { account_id: accountId, purpose: "step_up" });
+      expect(stepUpChallenge.status).toBe(200);
+      const stepUp = await post("/v1/auth/verify", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(stepUpChallenge.body.challenge, credId),
+        purpose: "step_up",
+      });
+      expect(stepUp.status).toBe(200);
+      expect(stepUp.body.layer).toBe("NORMAL"); // one step down from LOCK
     });
   });
 });

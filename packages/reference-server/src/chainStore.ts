@@ -59,6 +59,29 @@ export class ChainStore {
     return events.length === 0 ? "NORMAL" : events[events.length - 1].layer_after;
   }
 
+  /**
+   * Seconds remaining before a same-kind (non-step-up) attempt may be
+   * accepted again, per spec §5's cooldown rule. Gates only once the ladder
+   * has actually engaged (layer_after !== NORMAL) — a single mistaken
+   * attempt at NORMAL should never make a legitimate user wait. Step-up and
+   * recovery are never gated by this (see canInitiateStepUp in @cla/core);
+   * callers must not call this for purpose === "step_up".
+   */
+  cooldownRemainingSeconds(accountId: string): number {
+    const events = this.getEvents(accountId);
+    if (events.length === 0) return 0;
+    const last = events[events.length - 1];
+    if (last.layer_after === "NORMAL" || last.type !== "FAILURE") return 0;
+
+    const raw = last.detail?.cooldown_seconds;
+    const cooldown = typeof raw === "number" ? raw : 0;
+    if (cooldown <= 0) return 0;
+
+    const elapsedSeconds = (Date.now() - new Date(last.timestamp).getTime()) / 1000;
+    const remaining = cooldown - elapsedSeconds;
+    return remaining > 0 ? remaining : 0;
+  }
+
   /** Seq of the most recent event that actually changed the layer (a "transition"). */
   private lastLayerChangeSeq(accountId: string): number {
     const events = this.getEvents(accountId);
