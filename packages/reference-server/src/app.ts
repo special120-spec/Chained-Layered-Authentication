@@ -7,11 +7,27 @@ import { loadRpConfig } from "./webauthn.js";
 import { devicesRouter } from "./routes/devices.js";
 import { authRouter } from "./routes/auth.js";
 import { accountRouter } from "./routes/account.js";
+import { createRateLimiter, byIp } from "./rateLimit.js";
 
 export function createApp(db: Database, serverPrivateKey: KeyObject, serverKeyId: string): Express {
   const app = express();
   app.use(cors({ origin: process.env.CLA_ORIGIN ?? "http://localhost:5173" }));
   app.use(express.json());
+
+  // Blunt, general-purpose defense against raw request flooding (security
+  // review H3) — every endpoint-specific limiter below is layered on top
+  // of this, not instead of it. 120 req/min/IP is generous for normal use
+  // (register/auth/rotate ceremonies each take a few round trips) while
+  // still bounding a single source's total request volume.
+  //
+  // Overridable via CLA_RATE_LIMIT_IP_MAX: an integration test suite that
+  // exercises many endpoints from a single client IP (127.0.0.1) should
+  // raise this rather than share a production-sized budget across every
+  // test in the file — this general limiter is a coarse backstop, not
+  // itself the thing most tests are exercising (the per-account limiters
+  // in auth.ts/account.ts, and rateLimit.test.ts's direct unit tests, are).
+  const ipLimiterMax = Number(process.env.CLA_RATE_LIMIT_IP_MAX ?? 120);
+  app.use("/v1", createRateLimiter({ windowMs: 60_000, max: ipLimiterMax, keyFn: byIp, code: "rate_limited" }));
 
   const chain = new ChainStore(db, serverPrivateKey, serverKeyId);
   const rp = loadRpConfig();

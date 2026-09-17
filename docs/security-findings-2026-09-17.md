@@ -63,12 +63,16 @@ Lower sensitivity than H1 (returns only `device_id`, `created_at`, `status`), bu
 
 **Recommendation:** same session/step-up gate as H1, or accept as a documented trade-off if device metadata is considered non-sensitive for your deployment — but decide explicitly rather than by omission.
 
-### H3 — 🔴 `/v1/account/recovery/start` has no rate limiting or owner notification
-**File:** `packages/reference-server/src/routes/account.ts`
+### H3 — 🟡 PARTIALLY FIXED: `/v1/account/recovery/start` had no rate limiting or owner notification
+**File:** `packages/reference-server/src/routes/account.ts`, new `src/rateLimit.ts`
 
-Requiring no signature here is a documented, structurally necessary trade-off (§7 of the design doc) — that part is not the finding. The finding is that nothing else bounds it: anyone who knows `account_id` can force `RECOVERY` on demand, repeatedly, forever, with no side channel warning the real owner.
+Requiring no signature here is a documented, structurally necessary trade-off (§7 of the design doc) — that part was never the finding. The finding was that nothing else bounded it.
 
-**Recommendation:** rate-limit per `account_id` and per source IP; fire a notification (email/push) to the account's registered contact whenever recovery is requested, so the legitimate owner has a chance to notice and react to unsolicited attempts.
+**Fix applied (the rate-limiting half):** a new in-memory `createRateLimiter` (fixed-window, per-key) is now wired in at three layers: a general 120/min/IP backstop across all of `/v1/*`; a 30/min-per-account limiter on `/v1/auth/challenge` and `/v1/auth/verify` (defense-in-depth for the residual gap noted in the C1 fix — calling `/challenge` first is still free, this bounds how fast that path can be exercised); and endpoint-specific limits on `/v1/account/recovery/start` (3/hour/account) and `/recovery/complete` (10/hour, both per-account and per-IP). Unit-tested directly (`test/rateLimit.test.ts`) plus one integration test confirming the real wiring (`recovery/start`'s cap trips on the 4th call, a different account is unaffected).
+
+**Still open (the notification half):** nothing fires a signal to the account's registered contact when recovery is requested. This needs an actual notification channel (email/push) that doesn't exist anywhere in this reference server yet — out of scope for an in-process fix, flagged here so it isn't lost.
+
+Also still open, same root cause as H1/H2 below: this reference server is in-memory/single-process, so the rate limiter (and everything else) resets on restart and doesn't share state across multiple instances — fine for the reference implementation, not for a horizontally-scaled deployment (would need a shared store, e.g. Redis).
 
 ---
 
@@ -134,6 +138,7 @@ Not in the original findings list — flagged separately while first reading the
 ## Suggested next steps, in order
 
 1. ~~Fix M1–M4~~ 🟢 done, plus the cloned-authenticator gap found along the way. 36 tests passing across all packages; the M4 concurrency regression test run 5x clean.
-2. Add per-account and per-IP rate limiting at the app level (H3, and defense-in-depth for the residual gap C1's fix doesn't close — see its note above).
-3. Implement session issuance for `/v1/auth/verify` (`session_token` is in the spec's endpoint table but not implemented), then gate H1/H2 behind it.
+2. ~~Add per-account and per-IP rate limiting~~ 🟡 done (H3's rate-limiting half; owner notification on recovery-start is still open — needs an actual email/push channel this reference server doesn't have). 42 tests passing.
+3. Implement session issuance for `/v1/auth/verify` (`session_token` is in the spec's endpoint table but not implemented), then gate H1/H2 behind it. Next up.
 4. A basic fuzz pass on request bodies (oversized payloads, deeply nested objects, unicode edge cases) beyond the type-confusion case M3's fix specifically targets — `isValidId` is narrow by design, not a full schema validator.
+5. Recovery owner-notification (the open half of H3) and a shared rate-limit store for multi-instance deployments (the open half of both H3 and the in-memory limitation noted in H1/H2 below).

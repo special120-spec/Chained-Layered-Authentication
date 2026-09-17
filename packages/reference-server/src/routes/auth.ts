@@ -5,6 +5,7 @@ import type { ChainStore } from "../chainStore.js";
 import type { RpConfig } from "../webauthn.js";
 import { asyncHandler } from "../asyncHandler.js";
 import { isValidId } from "../validate.js";
+import { createRateLimiter, byAccountId } from "../rateLimit.js";
 import {
   getActiveDevices,
   getActiveDeviceByCredentialId,
@@ -17,8 +18,23 @@ import {
 export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Router {
   const router = Router();
 
+  // Defense-in-depth alongside the cooldown check inside /verify itself
+  // (security review H3, and the residual gap noted in the C1 fix: calling
+  // /challenge is free and unauthenticated by necessity, so an attacker
+  // willing to make two round trips per attempt instead of one isn't fully
+  // stopped by C1's fix alone). Per-account, not just per-IP, since the
+  // whole point is bounding attempts against ONE known account regardless
+  // of how many IPs an attacker rotates through.
+  const perAccountLimiter = createRateLimiter({
+    windowMs: 60_000,
+    max: 30,
+    keyFn: byAccountId,
+    code: "rate_limited",
+  });
+
   router.post(
     "/challenge",
+    perAccountLimiter,
     asyncHandler(async (req, res) => {
       const { account_id, purpose } = req.body ?? {};
       if (!isValidId(account_id)) return res.status(400).json({ error: "account_id required" });
@@ -32,6 +48,7 @@ export function authRouter(db: Database, chain: ChainStore, rp: RpConfig): Route
 
   router.post(
     "/verify",
+    perAccountLimiter,
     asyncHandler(async (req, res) => {
       const { account_id, assertionResponse, purpose } = req.body ?? {};
       if (!isValidId(account_id) || !assertionResponse?.response?.clientDataJSON) {

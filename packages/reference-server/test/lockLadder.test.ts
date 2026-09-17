@@ -73,6 +73,11 @@ describe("CLA reference server", () => {
 
   beforeAll(() => {
     process.env.CLA_ADMIN_TOKEN = "test-admin-token";
+    // This suite exercises many endpoints from one client IP across many
+    // tests — raise the general IP backstop so it doesn't interfere with
+    // tests that aren't about it. The limiter itself is unit-tested
+    // directly in rateLimit.test.ts.
+    process.env.CLA_RATE_LIMIT_IP_MAX = "100000";
     db = openDb(":memory:");
     const { privateKey } = generateKeyPairSync("ed25519");
     const app = createApp(db, privateKey, "test-key");
@@ -473,6 +478,26 @@ describe("CLA reference server", () => {
       expect(lastEvent.detail.reason).toBe("possible_cloned_authenticator");
 
       mockNewCounter = 1; // restore default for any later test
+    });
+  });
+
+  describe("hardening: H3 rate limiting (wiring only — createRateLimiter's own logic is unit-tested in rateLimit.test.ts)", () => {
+    it("/v1/account/recovery/start is capped at 3/hour per account", async () => {
+      const accountId = `acct_${randomUUID()}`;
+      for (let i = 0; i < 3; i++) {
+        const res = await post("/v1/account/recovery/start", { account_id: accountId });
+        expect(res.status).toBe(200);
+      }
+      const fourth = await post("/v1/account/recovery/start", { account_id: accountId });
+      expect(fourth.status).toBe(429);
+      expect(fourth.body.error).toBe("rate_limited");
+      expect(fourth.body.retry_after_seconds).toBeGreaterThan(0);
+
+      // A different account is entirely unaffected — this is a per-account
+      // limit, not a global one.
+      const otherAccount = `acct_${randomUUID()}`;
+      const otherRes = await post("/v1/account/recovery/start", { account_id: otherAccount });
+      expect(otherRes.status).toBe(200);
     });
   });
 });
