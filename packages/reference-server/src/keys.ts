@@ -27,6 +27,9 @@ export function loadOrCreateServerKeys(path: string): ServerKeys {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const keyId = `k_${Date.now().toString(36)}`;
   const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  writeFileSync(path, JSON.stringify({ keyId, privateKeyPem }, null, 2));
+  // mode 0o600: owner read/write only. Without this the key lands at the
+  // process umask default (commonly 0o644 — world-readable) on POSIX
+  // systems (security review M2).
+  writeFileSync(path, JSON.stringify({ keyId, privateKeyPem }, null, 2), { mode: 0o600 });
   return { keyId, privateKey, publicKey };
 }

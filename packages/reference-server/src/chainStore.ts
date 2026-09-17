@@ -1,7 +1,6 @@
 import type { Database } from "better-sqlite3";
 import type { KeyObject } from "node:crypto";
 import {
-  computeEntryHash,
   stepUpOnFailure,
   stepDown,
   cooldownSeconds,
@@ -11,7 +10,7 @@ import {
   type Layer,
   type Receipt,
 } from "@cla/core";
-import { signEntryHash } from "@cla/core/server-signing";
+import { signEntryHash, computeEntryHashSync } from "@cla/core/server-signing";
 import type { ChainEventRow } from "./db.js";
 
 export class ChainStore {
@@ -122,15 +121,30 @@ export class ChainStore {
     return row?.entry_hash ?? null;
   }
 
-  /** Appends one event, computing its hash/signature, and persists it. */
-  private async append(
+  /**
+   * Appends one event, computing its hash/signature, and persists it.
+   *
+   * Deliberately synchronous, start to finish (security review M4): the
+   * only way two concurrent requests for the same account could corrupt
+   * the chain is if something here yielded to the event loop between
+   * reading the current tip (nextSeq/lastHash) and writing the new row —
+   * that's the actual window a race needs, not the lack of a `BEGIN`/
+   * `COMMIT`. better-sqlite3 is itself synchronous and single-connection,
+   * so a method with zero `await`s in it cannot be interleaved with
+   * another request's handler; Node's single-threaded event loop already
+   * gives that for free. This is why chainStore uses the synchronous
+   * `computeEntryHashSync` (node:crypto) here rather than the browser-safe
+   * async `computeEntryHash` (Web Crypto) that @cla/core exports for
+   * clients — reintroducing that `await` would reopen the race.
+   */
+  private append(
     accountId: string,
     deviceId: string | null,
     type: ChainEventType,
     layerBefore: Layer,
     layerAfter: Layer,
     detail?: Record<string, unknown>
-  ): Promise<{ event: ChainEvent; receipt: Receipt }> {
+  ): { event: ChainEvent; receipt: Receipt } {
     const event: ChainEvent = {
       seq: this.nextSeq(accountId),
       account_id: accountId,
@@ -142,7 +156,7 @@ export class ChainStore {
       detail,
     };
     const prevHash = this.lastHash(accountId);
-    const entryHash = await computeEntryHash(prevHash, event);
+    const entryHash = computeEntryHashSync(prevHash, event);
     const serverSig = signEntryHash(entryHash, this.serverPrivateKey);
 
     this.db

@@ -21,5 +21,16 @@ export function createApp(db: Database, serverPrivateKey: KeyObject, serverKeyId
   app.use("/v1/auth", authRouter(db, chain, rp));
   app.use("/v1/account", accountRouter(db, chain));
 
+  // Final safety net (security review M3): every route is wrapped in
+  // asyncHandler so rejections reach here instead of crashing the process,
+  // and any synchronous throw (a malformed body reaching better-sqlite3,
+  // say) lands here too via Express's own handling. Never leaks internals.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error("[cla] unhandled route error:", err);
+    if (res.headersSent) return;
+    res.status(500).json({ error: "internal_error" });
+  });
+
   return app;
 }

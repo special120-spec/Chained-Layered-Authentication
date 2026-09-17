@@ -72,35 +72,40 @@ Requiring no signature here is a documented, structurally necessary trade-off (�
 
 ---
 
-## Medium — implementation hygiene (open)
+## Medium — implementation hygiene
 
-### M1 — 🔴 Timing side-channel on the admin token
-**File:** `packages/reference-server/src/routes/account.ts`
+### M1 — 🟢 FIXED: Timing side-channel on the admin token
+**File:** `packages/reference-server/src/routes/account.ts`, new `src/safeCompare.ts`
 
-```ts
-if (admin_token !== process.env.CLA_ADMIN_TOKEN) { ... }
-```
+Was a plain `!==` comparison. **Fix applied:** `safeEqual()` hashes both sides (SHA-256) before `crypto.timingSafeEqual` — normalizes length so the constant-time comparison can run at all without a length-mismatch throw, and avoids leaking the secret's length via that throw.
 
-Non-constant-time string comparison. **Fix:** use `crypto.timingSafeEqual` on fixed-length buffers (hash or pad both sides first, since it requires equal-length inputs).
-
-### M2 — 🔴 Server signing key written world-readable
+### M2 — 🟢 FIXED: Server signing key written world-readable
 **File:** `packages/reference-server/src/keys.ts`
 
-`writeFileSync(path, ...)` sets no explicit file mode, so the Ed25519 private key lands at the process umask default (commonly `0644`). **Fix:** `writeFileSync(path, data, { mode: 0o600 })`.
+**Fix applied:** `writeFileSync(path, data, { mode: 0o600 })`.
 
-### M3 — 🔴 Unhandled promise rejections can crash the whole server
-**Files:** all of `packages/reference-server/src/routes/*.ts`, `app.ts`
+### M3 — 🟢 FIXED (crash risk): Unhandled promise rejections could crash the whole server
+**Files:** `packages/reference-server/src/asyncHandler.ts`, `src/validate.ts`, `app.ts`, every route file
 
-Every route is `async (req, res) => {...}` with no wrapping try/catch outside the WebAuthn calls. A malformed request body (e.g. `account_id` as an object/array) throws synchronously inside `better-sqlite3`'s `.run()`/`.get()`. Express 4 does **not** catch rejections thrown from async handlers, and Node has terminated on unhandled rejections by default since v15 — one malformed request can take down every account's auth.
+**Fix applied:** every route now goes through a new `asyncHandler` wrapper (`Promise.resolve(fn(...)).catch(next)`), plus a final error-handling middleware in `app.ts` that returns a clean `500` instead of the process crashing. Also added `isValidId` guards on every `account_id`/`device_id`/ticket field pulled from a request body or query string, closing the concrete example given (an object/array where a string id was expected). New test: a request with `account_id` as an object gets a clean `400`, and the server is confirmed still serving `/healthz` afterward.
 
-**Fix:** upgrade to Express 5 (catches these natively), or wrap every handler in an `asyncHandler` helper that forwards to `next(err)` plus a real error-handling middleware in `app.ts`; add request body schema validation (e.g. zod) so malformed types never reach the DB layer.
+Not done in this pass, still a worthwhile follow-up: a general request-body *schema* validator (e.g. zod) — `isValidId` is narrowly scoped to id-shaped strings, not a full replacement for one.
 
-### M4 — 🔴 `chainStore.append`'s read-then-write isn't transactional
-**File:** `packages/reference-server/src/chainStore.ts`
+### M4 — 🟢 FIXED: `chainStore.append`'s read-then-write wasn't safe under concurrency
+**File:** `packages/reference-server/src/chainStore.ts`, `packages/core/src/serverSigning.ts`
 
-`nextSeq()` and `lastHash()` are read, then an `INSERT` happens, with no transaction wrapping the sequence. Two concurrent requests for the same account can both read the same `maxSeq`/last hash; the `(account_id, seq)` primary key will reject the second `INSERT`, but there's no retry — the caller just gets an unhandled 500 (see M3).
+Root cause was more specific than "no transaction": `append` read `nextSeq()`/`lastHash()`, then did `await computeEntryHash(...)` — a genuine yield to the event loop — before the `INSERT`. That `await` was the actual race window; wrapping it in a `better-sqlite3` `.transaction()` wasn't a viable fix as originally suggested, since that API only supports synchronous callbacks and `computeEntryHash` (Web Crypto, for browser-safety) is inherently async.
 
-**Fix:** wrap `append` in a `better-sqlite3` transaction (`db.transaction(...)`).
+**Fix applied:** added `computeEntryHashSync` (`node:crypto`, identical output) for server-internal use, and made `ChainStore.append` fully synchronous end to end — no `await` between reading the chain's tip and writing the new row, which is sufficient on a single-threaded, single-connection better-sqlite3 setup (no other code can interleave mid-synchronous-function). The browser SDK keeps using the original async `computeEntryHash` unchanged. New test: 8 concurrent `/v1/auth/verify` calls against the same account produce a strictly-ordered, no-duplicate-seq, hash-valid chain, run 5x to check for flakiness.
+
+---
+
+## Additional finding beyond this review's scope (fixed)
+
+### Cloned-authenticator detection was missing entirely
+**File:** `packages/reference-server/src/routes/auth.ts`
+
+Not in the original findings list — flagged separately while first reading the codebase, fixed in the same pass as M1-M4 since it touches the same file. WebAuthn's signature counter exists specifically to detect a duplicated/cloned credential: if an authenticator has ever reported a nonzero counter, a later assertion reporting a counter that isn't strictly greater is that signal. The server previously just overwrote `sign_count` with whatever was reported, with no check. **Fix applied:** a same-or-lower nonzero counter is now rejected as `possible_cloned_authenticator` (recorded as a real chain `FAILURE`, same as any other failed attempt) instead of silently accepted. Authenticators that always report `0` (common for platform authenticators, confirmed in this project's own manual testing with Windows Hello) are correctly exempt, per spec.
 
 ---
 
@@ -128,7 +133,7 @@ Every route is `async (req, res) => {...}` with no wrapping try/catch outside th
 
 ## Suggested next steps, in order
 
-1. Implement session issuance for `/v1/auth/verify` (`session_token` is in the spec's endpoint table but not implemented), then gate H1/H2 behind it.
-2. Add per-account and per-IP rate limiting at the app level (H3, and defense-in-depth for C1/C2).
-3. Fix M1–M4 (small, independent, low-risk changes).
-4. Re-run the full test suite plus a basic fuzz pass on request bodies (malformed types, missing fields, oversized payloads) to confirm M3 is actually closed before considering this production-ready.
+1. ~~Fix M1–M4~~ 🟢 done, plus the cloned-authenticator gap found along the way. 36 tests passing across all packages; the M4 concurrency regression test run 5x clean.
+2. Add per-account and per-IP rate limiting at the app level (H3, and defense-in-depth for the residual gap C1's fix doesn't close — see its note above).
+3. Implement session issuance for `/v1/auth/verify` (`session_token` is in the spec's endpoint table but not implemented), then gate H1/H2 behind it.
+4. A basic fuzz pass on request bodies (oversized payloads, deeply nested objects, unicode edge cases) beyond the type-confusion case M3's fix specifically targets — `isValidId` is narrow by design, not a full schema validator.

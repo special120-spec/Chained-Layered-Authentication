@@ -13,6 +13,7 @@ import { verifyChain, type ChainEvent, type Receipt } from "@cla/core";
 // given ceremony claims to be — exactly what a real browser's WebAuthn
 // implementation does by tracking credential ids itself.
 let authShouldVerify = true;
+let mockNewCounter = 1;
 
 vi.mock("@simplewebauthn/server", () => ({
   generateRegistrationOptions: vi.fn(async () => ({
@@ -33,7 +34,7 @@ vi.mock("@simplewebauthn/server", () => ({
   })),
   verifyAuthenticationResponse: vi.fn(async () => ({
     verified: authShouldVerify,
-    authenticationInfo: { newCounter: 1 },
+    authenticationInfo: { newCounter: mockNewCounter },
   })),
 }));
 
@@ -376,6 +377,102 @@ describe("CLA reference server", () => {
       });
       expect(stepUp.status).toBe(200);
       expect(stepUp.body.layer).toBe("NORMAL"); // one step down from LOCK
+    });
+  });
+
+  describe("hardening: M1-M4", () => {
+    it("M3: a malformed body (account_id as an object) is rejected with 400, not a crash", async () => {
+      // Regression for the crash scenario security review M3 describes:
+      // this used to reach better-sqlite3's .get()/.run() with a non-string
+      // bind parameter and throw synchronously inside an async handler,
+      // which Express 4 does not catch. asyncHandler + isValidId close it.
+      const res = await post("/v1/devices/register/start", { account_id: { evil: true } });
+      expect(res.status).toBe(400);
+
+      const res2 = await post("/v1/auth/verify", { account_id: ["a", "b"], assertionResponse: {} });
+      expect(res2.status).toBe(400);
+
+      // The server must still be alive and serving other requests after both.
+      const health = await fetch(`${baseUrl}/healthz`);
+      expect(health.status).toBe(200);
+    });
+
+    it("M4: concurrent failed attempts against the same account never corrupt the chain", async () => {
+      // Regression for the race in chainStore.append: before the fix,
+      // nextSeq()/lastHash() were read, then an `await computeEntryHash`
+      // yielded to the event loop before the INSERT — a real window for
+      // another concurrent request to read the same stale tip. Fired
+      // concurrently on purpose; a correct implementation serializes them
+      // (or fails outright) rather than corrupting the sequence or the hash
+      // links, since chainStore.append is now synchronous end to end.
+      const accountId = `acct_${randomUUID()}`;
+      const credId = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId });
+      await post("/v1/devices/register/finish", {
+        account_id: accountId,
+        attestationResponse: fakeAttestation(start.body.challenge, credId),
+      });
+
+      authShouldVerify = false;
+      const N = 8;
+      const challenges = await Promise.all(
+        Array.from({ length: N }, () => post("/v1/auth/challenge", { account_id: accountId }))
+      );
+      const results = await Promise.all(
+        challenges.map((c) =>
+          post("/v1/auth/verify", { account_id: accountId, assertionResponse: fakeAssertion(c.body.challenge, credId) })
+        )
+      );
+      // Every concurrent request must get a clean response either way —
+      // never a 500, never a hang.
+      for (const r of results) expect([401, 429]).toContain(r.status);
+
+      const audit = (await get(`/v1/account/${accountId}/audit-log`)).body as {
+        events: ChainEvent[];
+        receipts: Receipt[];
+      };
+      const seqs = audit.events.map((e) => e.seq);
+      expect(seqs).toEqual([...seqs].sort((a, b) => a - b)); // strictly ordered
+      expect(new Set(seqs).size).toBe(seqs.length); // no duplicate seq — the actual failure mode a race would cause
+      const result = await verifyChain(audit.events, audit.receipts);
+      expect(result.valid).toBe(true); // the hash chain itself is still internally consistent
+    });
+
+    it("cloned-authenticator detection: a signature counter that doesn't advance is rejected once the authenticator has reported a nonzero count", async () => {
+      const accountId = `acct_${randomUUID()}`;
+      const credId = `cred-${randomUUID()}`;
+      const start = await post("/v1/devices/register/start", { account_id: accountId });
+      await post("/v1/devices/register/finish", {
+        account_id: accountId,
+        attestationResponse: fakeAttestation(start.body.challenge, credId),
+      });
+
+      authShouldVerify = true;
+      mockNewCounter = 5; // first real auth: counter advances from 0 (registration) to 5
+      const challenge1 = await post("/v1/auth/challenge", { account_id: accountId });
+      const first = await post("/v1/auth/verify", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge1.body.challenge, credId),
+      });
+      expect(first.status).toBe(200);
+
+      // A second assertion reporting the SAME (non-advancing) counter is the
+      // WebAuthn-spec signal of a cloned authenticator — must be rejected,
+      // not silently accepted.
+      mockNewCounter = 5;
+      const challenge2 = await post("/v1/auth/challenge", { account_id: accountId });
+      const second = await post("/v1/auth/verify", {
+        account_id: accountId,
+        assertionResponse: fakeAssertion(challenge2.body.challenge, credId),
+      });
+      expect(second.status).toBe(401);
+
+      const audit = await get(`/v1/account/${accountId}/audit-log`);
+      const lastEvent = audit.body.events[audit.body.events.length - 1];
+      expect(lastEvent.type).toBe("FAILURE");
+      expect(lastEvent.detail.reason).toBe("possible_cloned_authenticator");
+
+      mockNewCounter = 1; // restore default for any later test
     });
   });
 });
