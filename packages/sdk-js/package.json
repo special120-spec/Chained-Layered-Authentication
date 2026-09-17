@@ -1,0 +1,21 @@
+{
+  "name": "@cla/sdk-js",
+  "version": "0.1.0",
+  "description": "Browser client SDK for Chained Layered Authentication. Hides WebAuthn ceremonies, chain receipts, and lock-state polling behind a small async API.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cla/core": "^0.1.0",
+    "@simplewebauthn/browser": "^11.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

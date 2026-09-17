@@ -1,0 +1,20 @@
+{
+  "name": "chained-layered-auth",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Chained Layered Authentication (CLA) - challenge-response auth with a tamper-evident event chain and a progressive lockout ladder, built on WebAuthn.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "dev:server": "npm run dev --workspace packages/reference-server",
+    "dev:demo": "npm run dev --workspace examples/demo"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

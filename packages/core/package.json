@@ -1,0 +1,27 @@
+{
+  "name": "@cla/core",
+  "version": "0.1.0",
+  "description": "Chain, lock-state machine, and policy engine for Chained Layered Authentication. Pure TypeScript, no I/O.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server-signing": {
+      "types": "./dist/serverSigning.d.ts",
+      "import": "./dist/serverSigning.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

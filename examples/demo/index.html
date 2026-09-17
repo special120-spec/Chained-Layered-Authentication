@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>CLA demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+      h1 { font-size: 1.4rem; }
+      .layer { display: inline-block; padding: 4px 12px; border-radius: 999px; font-weight: 600; font-size: 0.9rem; }
+      .layer-NORMAL { background: #dcfce7; color: #166534; }
+      .layer-LOCK { background: #fef9c3; color: #854d0e; }
+      .layer-STEP_UP { background: #ffedd5; color: #9a3412; }
+      .layer-RECOVERY { background: #fee2e2; color: #991b1b; }
+      button { margin: 4px 6px 4px 0; padding: 8px 14px; border-radius: 6px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+      button:hover { background: #f5f5f5; }
+      #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 0.8rem; background: #f8f8f8; border: 1px solid #eee; border-radius: 6px; padding: 12px; max-height: 320px; overflow: auto; }
+      input { padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc; width: 220px; }
+      section { margin-bottom: 24px; }
+      .hint { color: #666; font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Chained Layered Authentication — demo</h1>
+    <p class="hint">
+      Needs a real platform authenticator (Windows Hello, Touch ID, a security key) for Register/Authenticate/Step
+      up/Revoke/Rotate — those are genuine WebAuthn ceremonies. "Simulate failed attempts" bypasses the browser
+      ceremony to demonstrate the lock ladder without 11 real failed prompts.
+    </p>
+
+    <section>
+      <label>Account id: <input id="accountId" value="demo-user" /></label>
+      <div>Current layer: <span id="layer" class="layer">unknown</span></div>
+    </section>
+
+    <section>
+      <h3>Identity</h3>
+      <button id="register">Register device</button>
+      <button id="authenticate">Authenticate</button>
+      <button id="rotate">Rotate key</button>
+      <button id="revoke">Revoke device</button>
+    </section>
+
+    <section>
+      <h3>Lock ladder</h3>
+      <button id="simulateFailures">Simulate 3 failed attempts</button>
+      <button id="stepUp">Step up</button>
+      <button id="startRecovery">Start recovery</button>
+      <button id="completeRecovery">Complete recovery (admin token)</button>
+    </section>
+
+    <section>
+      <h3>Audit chain</h3>
+      <button id="refreshLog">Refresh audit log</button>
+      <button id="verifyChain">Verify chain against cached receipt</button>
+      <div id="log">(no data yet)</div>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
